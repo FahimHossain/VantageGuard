@@ -5,7 +5,7 @@ import subprocess
 import winreg
 import comtypes.client
 import tkinter as tk
-from tkinter import simpledialog, messagebox
+from tkinter import messagebox
 from PIL import Image, ImageDraw
 from ctypes import cast, POINTER
 from comtypes import CLSCTX_ALL, CoInitialize, CoUninitialize
@@ -112,9 +112,7 @@ def trigger_ui_update():
         tray_icon.title = f"Mic: {'MUTED' if is_mic_muted else 'LIVE'} | Cam: {'MUTED' if is_cam_muted else 'LIVE'} | Loc: {'MUTED' if is_loc_muted else 'LIVE'}"
     
     if app_ui:
-        # Tkinter needs UI updates to happen on the main thread
         app_ui.root.after(0, app_ui.refresh_colors)
-
 
 def create_icon_image(mic_muted, cam_muted, loc_muted):
     """Generates the 3-way split icon for the system tray."""
@@ -130,6 +128,46 @@ def create_icon_image(mic_muted, cam_muted, loc_muted):
     return image
 
 # --- Tkinter GUI Application ---
+
+class HotkeyCatcher(tk.Toplevel):
+    """A custom popup window that actively listens for the user's keystrokes."""
+    def __init__(self, parent, target_name):
+        super().__init__(parent)
+        self.title("Listening...")
+        self.geometry("300x120")
+        self.resizable(False, False)
+        
+        # Make this window grab focus and prevent clicking the main app behind it
+        self.transient(parent)
+        self.grab_set()
+
+        self.result = None
+        self.is_active = True
+        
+        tk.Label(self, text=f"Press the new hotkey for {target_name.upper()} now...", font=("Arial", 10, "bold")).pack(pady=(20, 5))
+        tk.Label(self, text="(Press 'Esc' to cancel)").pack()
+        
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+        
+        # Start listening in a background thread so the UI doesn't freeze
+        threading.Thread(target=self.catch_keys, daemon=True).start()
+
+    def catch_keys(self):
+        # This function blocks until a combination is pressed and released
+        hk = keyboard.read_hotkey(suppress=False)
+        
+        if self.is_active:
+            # Pass the result back to the main Tkinter thread safely
+            self.after(0, self.finish, hk)
+
+    def finish(self, hk):
+        if hk != 'esc':
+            self.result = hk
+        self.on_close()
+
+    def on_close(self):
+        self.is_active = False
+        self.destroy()
 
 class VantageGUI:
     def __init__(self, root):
@@ -152,54 +190,54 @@ class VantageGUI:
         self.loc_frame.pack(fill='both', expand=True)
 
         # --- Mic Controls ---
-        self.lbl_mic_hotkey = tk.Label(self.mic_frame, text=f"Hotkey: {hotkeys['mic'].upper()}", width=12, bg='white')
+        self.lbl_mic_hotkey = tk.Label(self.mic_frame, text=f"Hotkey: {hotkeys['mic'].upper()}", width=18, bg='white')
         self.lbl_mic_hotkey.pack(side='left', padx=5)
         tk.Button(self.mic_frame, text="Set Hotkey", command=lambda: self.set_hotkey('mic')).pack(side='left', padx=5)
-        tk.Button(self.mic_frame, text="Toggle Mic", command=toggle_mic).pack(side='left', padx=5)
+        tk.Button(self.mic_frame, text="Toggle Mic", command=toggle_mic, width=10).pack(side='left', padx=5)
 
         # --- Cam Controls ---
-        self.lbl_cam_hotkey = tk.Label(self.cam_frame, text=f"Hotkey: {hotkeys['cam'].upper()}", width=12, bg='white')
+        self.lbl_cam_hotkey = tk.Label(self.cam_frame, text=f"Hotkey: {hotkeys['cam'].upper()}", width=18, bg='white')
         self.lbl_cam_hotkey.pack(side='left', padx=5)
         tk.Button(self.cam_frame, text="Set Hotkey", command=lambda: self.set_hotkey('cam')).pack(side='left', padx=5)
-        tk.Button(self.cam_frame, text="Toggle Cam", command=toggle_cam).pack(side='left', padx=5)
+        tk.Button(self.cam_frame, text="Toggle Cam", command=toggle_cam, width=10).pack(side='left', padx=5)
 
         # --- Loc Controls ---
-        self.lbl_loc_hotkey = tk.Label(self.loc_frame, text=f"Hotkey: {hotkeys['loc'].upper()}", width=12, bg='white')
+        self.lbl_loc_hotkey = tk.Label(self.loc_frame, text=f"Hotkey: {hotkeys['loc'].upper()}", width=18, bg='white')
         self.lbl_loc_hotkey.pack(side='left', padx=5)
         tk.Button(self.loc_frame, text="Set Hotkey", command=lambda: self.set_hotkey('loc')).pack(side='left', padx=5)
-        tk.Button(self.loc_frame, text="Toggle Loc", command=toggle_loc).pack(side='left', padx=5)
+        tk.Button(self.loc_frame, text="Toggle Loc", command=toggle_loc, width=10).pack(side='left', padx=5)
 
         self.refresh_colors()
 
     def refresh_colors(self):
-        """Updates the background color of the frames based on current hardware states."""
         self.mic_frame.config(bg='red' if is_mic_muted else 'green')
         self.cam_frame.config(bg='red' if is_cam_muted else 'green')
         self.loc_frame.config(bg='red' if is_loc_muted else 'green')
 
     def hide_window(self):
-        """Hides the GUI but keeps the app running in the system tray."""
         self.root.withdraw()
 
     def show_window(self):
-        """Restores the GUI from the system tray."""
         self.root.deiconify()
         self.root.lift()
 
     def set_hotkey(self, target):
-        """Prompts user for a new hotkey and re-binds it via the keyboard module."""
         current = hotkeys[target]
-        new_key = simpledialog.askstring("Set Hotkey", f"Enter new hotkey for {target.upper()}\n(e.g., f24, ctrl+shift+m):", initialvalue=current)
         
+        # Open our custom listener window and wait for it to close
+        listener = HotkeyCatcher(self.root, target)
+        self.root.wait_window(listener)
+        
+        new_key = listener.result
         if new_key:
-            new_key = new_key.lower().strip()
             try:
-                # Test if the keyboard module accepts the string format
-                keyboard.parse_hotkey(new_key) 
+                # Safely try to unbind the old key
+                try:
+                    keyboard.remove_hotkey(current)
+                except ValueError:
+                    pass
                 
-                # Unbind old, bind new
-                keyboard.remove_hotkey(current)
-                
+                # Bind the new key
                 if target == 'mic':
                     keyboard.add_hotkey(new_key, toggle_mic)
                     self.lbl_mic_hotkey.config(text=f"Hotkey: {new_key.upper()}")
@@ -212,7 +250,7 @@ class VantageGUI:
                 
                 hotkeys[target] = new_key
             except Exception as e:
-                messagebox.showerror("Error", f"Invalid hotkey format.\n\nError: {e}")
+                messagebox.showerror("Error", f"Could not bind hotkey.\n\nError: {e}")
 
 # --- System Tray Setup ---
 
@@ -239,7 +277,6 @@ def run_tray():
 def main():
     global is_mic_muted, is_cam_muted, is_loc_muted, app_ui
     
-    # 1. Fetch initial states
     CoInitialize()
     mic = get_mic_endpoint()
     if mic:
@@ -249,15 +286,12 @@ def main():
     is_cam_muted = get_initial_cam_state()
     is_loc_muted = get_initial_loc_state()
 
-    # 2. Bind initial default hotkeys
     keyboard.add_hotkey(hotkeys['mic'], toggle_mic)
     keyboard.add_hotkey(hotkeys['cam'], toggle_cam)
     keyboard.add_hotkey(hotkeys['loc'], toggle_loc)
 
-    # 3. Start System Tray Icon in a Background Thread
     threading.Thread(target=run_tray, daemon=True).start()
 
-    # 4. Start Tkinter Main Window on the Main Thread
     root = tk.Tk()
     app_ui = VantageGUI(root)
     root.mainloop()
