@@ -5,19 +5,27 @@ import subprocess
 import winreg
 import comtypes.client
 import tkinter as tk
+from tkinter import messagebox
+import customtkinter as ctk
 import configparser
 import os
-from tkinter import messagebox
 from PIL import Image, ImageDraw
 from ctypes import cast, POINTER
 from comtypes import CLSCTX_ALL, CoInitialize, CoUninitialize
 from pycaw.pycaw import IAudioEndpointVolume, IMMDeviceEnumerator
 
+# --- Setup CustomTkinter Theme ---
+ctk.set_appearance_mode("Dark")
+ctk.set_default_color_theme("blue")
+
+# Modern Status Colors
+COLOR_LIVE = "#2A8C55"  # Soft Green
+COLOR_MUTED = "#C64747" # Soft Red
+
 # --- Configuration & File Handling ---
 CONFIG_DIR = os.path.join(os.getenv('APPDATA'), 'VantageGuard')
 CONFIG_FILE = os.path.join(CONFIG_DIR, 'config.ini')
 
-# Default fallback hotkeys
 hotkeys = {
     'mic': 'f22',
     'cam': 'f23',
@@ -25,7 +33,6 @@ hotkeys = {
 }
 
 def load_config():
-    """Loads hotkeys from the .ini file, or creates it if it doesn't exist."""
     if not os.path.exists(CONFIG_DIR):
         os.makedirs(CONFIG_DIR)
         
@@ -37,10 +44,9 @@ def load_config():
             hotkeys['cam'] = config['Hotkeys'].get('cam', hotkeys['cam'])
             hotkeys['loc'] = config['Hotkeys'].get('loc', hotkeys['loc'])
     else:
-        save_config() # Create default config file
+        save_config()
 
 def save_config():
-    """Saves the current hotkeys to the .ini file."""
     config = configparser.ConfigParser()
     config['Hotkeys'] = hotkeys
     with open(CONFIG_FILE, 'w') as configfile:
@@ -154,13 +160,13 @@ def create_icon_image(mic_muted, cam_muted, loc_muted):
     draw.line([42, 0, 42, 64], fill='black', width=2)
     return image
 
-# --- Tkinter GUI Application ---
+# --- CustomTkinter GUI Application ---
 
-class HotkeyCatcher(tk.Toplevel):
+class HotkeyCatcher(ctk.CTkToplevel):
     def __init__(self, parent, target_name):
         super().__init__(parent)
         self.title("Listening...")
-        self.geometry("300x120")
+        self.geometry("380x160") # Widened the listening popup slightly
         self.resizable(False, False)
         
         self.transient(parent)
@@ -169,8 +175,8 @@ class HotkeyCatcher(tk.Toplevel):
         self.result = None
         self.is_active = True
         
-        tk.Label(self, text=f"Press the new hotkey for {target_name.upper()} now...", font=("Arial", 10, "bold")).pack(pady=(20, 5))
-        tk.Label(self, text="(Press 'Esc' to cancel)").pack()
+        ctk.CTkLabel(self, text=f"Set Hotkey for {target_name.upper()}", font=ctk.CTkFont(size=16, weight="bold")).pack(pady=(25, 5))
+        ctk.CTkLabel(self, text="Press your new key combination now...\n(Press 'Esc' to cancel)", text_color="gray").pack()
         
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         threading.Thread(target=self.catch_keys, daemon=True).start()
@@ -193,44 +199,57 @@ class VantageGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("VantageGuard")
-        self.root.geometry("350x220")
-        self.root.resizable(False, False)
+        
+        # Widen the default layout and set a minimum size
+        self.root.geometry("540x320")
+        self.root.minsize(450, 280)
         
         self.root.protocol("WM_DELETE_WINDOW", self.hide_window)
 
-        self.mic_frame = tk.Frame(root, pady=10, padx=10)
-        self.mic_frame.pack(fill='both', expand=True)
+        # Make the main window grid stretchable
+        self.root.grid_columnconfigure(0, weight=1)
+        self.root.grid_rowconfigure(0, weight=1)
+        self.root.grid_rowconfigure(1, weight=1)
+        self.root.grid_rowconfigure(2, weight=1)
+
+        # Create three frames, telling them to stick to all edges (nsew)
+        self.mic_frame = ctk.CTkFrame(self.root, corner_radius=10)
+        self.mic_frame.grid(row=0, column=0, padx=20, pady=(20, 5), sticky="nsew")
         
-        self.cam_frame = tk.Frame(root, pady=10, padx=10)
-        self.cam_frame.pack(fill='both', expand=True)
+        self.cam_frame = ctk.CTkFrame(self.root, corner_radius=10)
+        self.cam_frame.grid(row=1, column=0, padx=20, pady=5, sticky="nsew")
 
-        self.loc_frame = tk.Frame(root, pady=10, padx=10)
-        self.loc_frame.pack(fill='both', expand=True)
+        self.loc_frame = ctk.CTkFrame(self.root, corner_radius=10)
+        self.loc_frame.grid(row=2, column=0, padx=20, pady=(5, 20), sticky="nsew")
 
-        # --- Mic Controls ---
-        self.lbl_mic_hotkey = tk.Label(self.mic_frame, text=f"Hotkey: {hotkeys['mic'].upper()}", width=18, bg='white')
-        self.lbl_mic_hotkey.pack(side='left', padx=5)
-        tk.Button(self.mic_frame, text="Set Hotkey", command=lambda: self.set_hotkey('mic')).pack(side='left', padx=5)
-        tk.Button(self.mic_frame, text="Toggle Mic", command=toggle_mic, width=10).pack(side='left', padx=5)
-
-        # --- Cam Controls ---
-        self.lbl_cam_hotkey = tk.Label(self.cam_frame, text=f"Hotkey: {hotkeys['cam'].upper()}", width=18, bg='white')
-        self.lbl_cam_hotkey.pack(side='left', padx=5)
-        tk.Button(self.cam_frame, text="Set Hotkey", command=lambda: self.set_hotkey('cam')).pack(side='left', padx=5)
-        tk.Button(self.cam_frame, text="Toggle Cam", command=toggle_cam, width=10).pack(side='left', padx=5)
-
-        # --- Loc Controls ---
-        self.lbl_loc_hotkey = tk.Label(self.loc_frame, text=f"Hotkey: {hotkeys['loc'].upper()}", width=18, bg='white')
-        self.lbl_loc_hotkey.pack(side='left', padx=5)
-        tk.Button(self.loc_frame, text="Set Hotkey", command=lambda: self.set_hotkey('loc')).pack(side='left', padx=5)
-        tk.Button(self.loc_frame, text="Toggle Loc", command=toggle_loc, width=10).pack(side='left', padx=5)
+        self._build_row(self.mic_frame, 'mic', toggle_mic)
+        self._build_row(self.cam_frame, 'cam', toggle_cam)
+        self._build_row(self.loc_frame, 'loc', toggle_loc)
 
         self.refresh_colors()
 
+    def _build_row(self, parent_frame, target, toggle_cmd):
+        # Configure the inner frame's grid so column 0 (the label) eats all extra horizontal space
+        parent_frame.grid_columnconfigure(0, weight=1)
+        # Ensure the row stretches to center the elements vertically
+        parent_frame.grid_rowconfigure(0, weight=1)
+        
+        # Label (Pushed to the left)
+        lbl = ctk.CTkLabel(parent_frame, text=f"Hotkey: {hotkeys[target].upper()}", font=ctk.CTkFont(weight="bold", size=14), text_color="white")
+        lbl.grid(row=0, column=0, padx=20, pady=15, sticky="w")
+        
+        if target == 'mic': self.lbl_mic_hotkey = lbl
+        elif target == 'cam': self.lbl_cam_hotkey = lbl
+        elif target == 'loc': self.lbl_loc_hotkey = lbl
+
+        # Buttons (Pushed to the right)
+        ctk.CTkButton(parent_frame, text="Set Hotkey", width=100, fg_color="#333333", hover_color="#444444", command=lambda: self.set_hotkey(target)).grid(row=0, column=1, padx=10, pady=15)
+        ctk.CTkButton(parent_frame, text=f"Toggle {target.capitalize()}", width=100, fg_color="transparent", border_width=2, text_color="white", command=toggle_cmd).grid(row=0, column=2, padx=20, pady=15)
+
     def refresh_colors(self):
-        self.mic_frame.config(bg='red' if is_mic_muted else 'green')
-        self.cam_frame.config(bg='red' if is_cam_muted else 'green')
-        self.loc_frame.config(bg='red' if is_loc_muted else 'green')
+        self.mic_frame.configure(fg_color=COLOR_MUTED if is_mic_muted else COLOR_LIVE)
+        self.cam_frame.configure(fg_color=COLOR_MUTED if is_cam_muted else COLOR_LIVE)
+        self.loc_frame.configure(fg_color=COLOR_MUTED if is_loc_muted else COLOR_LIVE)
 
     def hide_window(self):
         self.root.withdraw()
@@ -248,23 +267,21 @@ class VantageGUI:
         new_key = listener.result
         if new_key:
             try:
-                try:
-                    keyboard.remove_hotkey(current)
-                except ValueError:
-                    pass
+                try: keyboard.remove_hotkey(current)
+                except ValueError: pass
                 
                 if target == 'mic':
                     keyboard.add_hotkey(new_key, toggle_mic)
-                    self.lbl_mic_hotkey.config(text=f"Hotkey: {new_key.upper()}")
+                    self.lbl_mic_hotkey.configure(text=f"Hotkey: {new_key.upper()}")
                 elif target == 'cam':
                     keyboard.add_hotkey(new_key, toggle_cam)
-                    self.lbl_cam_hotkey.config(text=f"Hotkey: {new_key.upper()}")
+                    self.lbl_cam_hotkey.configure(text=f"Hotkey: {new_key.upper()}")
                 elif target == 'loc':
                     keyboard.add_hotkey(new_key, toggle_loc)
-                    self.lbl_loc_hotkey.config(text=f"Hotkey: {new_key.upper()}")
+                    self.lbl_loc_hotkey.configure(text=f"Hotkey: {new_key.upper()}")
                 
                 hotkeys[target] = new_key
-                save_config() # <-- Save the new hotkey to the .ini file
+                save_config()
                 
             except Exception as e:
                 messagebox.showerror("Error", f"Could not bind hotkey.\n\nError: {e}")
@@ -294,7 +311,6 @@ def run_tray():
 def main():
     global is_mic_muted, is_cam_muted, is_loc_muted, app_ui
     
-    # 1. Load config file before binding keys
     load_config()
     
     CoInitialize()
@@ -312,7 +328,7 @@ def main():
 
     threading.Thread(target=run_tray, daemon=True).start()
 
-    root = tk.Tk()
+    root = ctk.CTk()
     app_ui = VantageGUI(root)
     root.mainloop()
 
