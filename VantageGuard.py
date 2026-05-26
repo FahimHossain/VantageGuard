@@ -5,22 +5,51 @@ import subprocess
 import winreg
 import comtypes.client
 import tkinter as tk
+import configparser
+import os
 from tkinter import messagebox
 from PIL import Image, ImageDraw
 from ctypes import cast, POINTER
 from comtypes import CLSCTX_ALL, CoInitialize, CoUninitialize
 from pycaw.pycaw import IAudioEndpointVolume, IMMDeviceEnumerator
 
-# --- Global States and Config ---
-is_mic_muted = False
-is_cam_muted = False
-is_loc_muted = False
+# --- Configuration & File Handling ---
+CONFIG_DIR = os.path.join(os.getenv('APPDATA'), 'VantageGuard')
+CONFIG_FILE = os.path.join(CONFIG_DIR, 'config.ini')
 
+# Default fallback hotkeys
 hotkeys = {
     'mic': 'f22',
     'cam': 'f23',
     'loc': 'f24'
 }
+
+def load_config():
+    """Loads hotkeys from the .ini file, or creates it if it doesn't exist."""
+    if not os.path.exists(CONFIG_DIR):
+        os.makedirs(CONFIG_DIR)
+        
+    config = configparser.ConfigParser()
+    if os.path.exists(CONFIG_FILE):
+        config.read(CONFIG_FILE)
+        if 'Hotkeys' in config:
+            hotkeys['mic'] = config['Hotkeys'].get('mic', hotkeys['mic'])
+            hotkeys['cam'] = config['Hotkeys'].get('cam', hotkeys['cam'])
+            hotkeys['loc'] = config['Hotkeys'].get('loc', hotkeys['loc'])
+    else:
+        save_config() # Create default config file
+
+def save_config():
+    """Saves the current hotkeys to the .ini file."""
+    config = configparser.ConfigParser()
+    config['Hotkeys'] = hotkeys
+    with open(CONFIG_FILE, 'w') as configfile:
+        config.write(configfile)
+
+# --- Global States ---
+is_mic_muted = False
+is_cam_muted = False
+is_loc_muted = False
 
 tray_icon = None
 app_ui = None
@@ -51,7 +80,7 @@ def toggle_mic():
 def toggle_cam():
     global is_cam_muted
     is_cam_muted = not is_cam_muted
-    trigger_ui_update() # Update UI instantly for responsiveness
+    trigger_ui_update() 
     
     try:
         if is_cam_muted:
@@ -106,7 +135,6 @@ def get_initial_loc_state():
 # --- UI Sync Logic ---
 
 def trigger_ui_update():
-    """Safely updates both the system tray and the Tkinter GUI."""
     if tray_icon:
         tray_icon.icon = create_icon_image(is_mic_muted, is_cam_muted, is_loc_muted)
         tray_icon.title = f"Mic: {'MUTED' if is_mic_muted else 'LIVE'} | Cam: {'MUTED' if is_cam_muted else 'LIVE'} | Loc: {'MUTED' if is_loc_muted else 'LIVE'}"
@@ -115,7 +143,6 @@ def trigger_ui_update():
         app_ui.root.after(0, app_ui.refresh_colors)
 
 def create_icon_image(mic_muted, cam_muted, loc_muted):
-    """Generates the 3-way split icon for the system tray."""
     image = Image.new('RGB', (64, 64))
     draw = ImageDraw.Draw(image)
     
@@ -130,14 +157,12 @@ def create_icon_image(mic_muted, cam_muted, loc_muted):
 # --- Tkinter GUI Application ---
 
 class HotkeyCatcher(tk.Toplevel):
-    """A custom popup window that actively listens for the user's keystrokes."""
     def __init__(self, parent, target_name):
         super().__init__(parent)
         self.title("Listening...")
         self.geometry("300x120")
         self.resizable(False, False)
         
-        # Make this window grab focus and prevent clicking the main app behind it
         self.transient(parent)
         self.grab_set()
 
@@ -148,16 +173,11 @@ class HotkeyCatcher(tk.Toplevel):
         tk.Label(self, text="(Press 'Esc' to cancel)").pack()
         
         self.protocol("WM_DELETE_WINDOW", self.on_close)
-        
-        # Start listening in a background thread so the UI doesn't freeze
         threading.Thread(target=self.catch_keys, daemon=True).start()
 
     def catch_keys(self):
-        # This function blocks until a combination is pressed and released
         hk = keyboard.read_hotkey(suppress=False)
-        
         if self.is_active:
-            # Pass the result back to the main Tkinter thread safely
             self.after(0, self.finish, hk)
 
     def finish(self, hk):
@@ -176,10 +196,8 @@ class VantageGUI:
         self.root.geometry("350x220")
         self.root.resizable(False, False)
         
-        # Override the close button (X) to hide instead of quit
         self.root.protocol("WM_DELETE_WINDOW", self.hide_window)
 
-        # Create three frames (rows) for Mic, Cam, Loc
         self.mic_frame = tk.Frame(root, pady=10, padx=10)
         self.mic_frame.pack(fill='both', expand=True)
         
@@ -224,20 +242,17 @@ class VantageGUI:
     def set_hotkey(self, target):
         current = hotkeys[target]
         
-        # Open our custom listener window and wait for it to close
         listener = HotkeyCatcher(self.root, target)
         self.root.wait_window(listener)
         
         new_key = listener.result
         if new_key:
             try:
-                # Safely try to unbind the old key
                 try:
                     keyboard.remove_hotkey(current)
                 except ValueError:
                     pass
                 
-                # Bind the new key
                 if target == 'mic':
                     keyboard.add_hotkey(new_key, toggle_mic)
                     self.lbl_mic_hotkey.config(text=f"Hotkey: {new_key.upper()}")
@@ -249,6 +264,8 @@ class VantageGUI:
                     self.lbl_loc_hotkey.config(text=f"Hotkey: {new_key.upper()}")
                 
                 hotkeys[target] = new_key
+                save_config() # <-- Save the new hotkey to the .ini file
+                
             except Exception as e:
                 messagebox.showerror("Error", f"Could not bind hotkey.\n\nError: {e}")
 
@@ -276,6 +293,9 @@ def run_tray():
 
 def main():
     global is_mic_muted, is_cam_muted, is_loc_muted, app_ui
+    
+    # 1. Load config file before binding keys
+    load_config()
     
     CoInitialize()
     mic = get_mic_endpoint()
