@@ -7,6 +7,8 @@ from tkinter import messagebox
 import customtkinter as ctk
 import configparser
 import os
+import pyaudio
+import collections
 from PIL import Image, ImageDraw
 from ctypes import cast, POINTER
 from comtypes import CLSCTX_ALL, CoInitialize, CoUninitialize
@@ -19,13 +21,25 @@ ctk.set_default_color_theme("blue")
 # Modern Status Colors
 COLOR_LIVE = "#2A8C55"  # Soft Green
 COLOR_MUTED = "#C64747" # Soft Red
+COLOR_NEUTRAL = "#2B2B2B"
 
 # --- Configuration & File Handling ---
 CONFIG_DIR = os.path.join(os.getenv('APPDATA'), 'VantageGuard')
 CONFIG_FILE = os.path.join(CONFIG_DIR, 'config.ini')
 
-hotkeys = {
-    'mic': 'f22'
+settings = {
+    'mic_hotkey': 'f22',
+    'delay_val': 'No Delay'
+}
+
+DELAY_MAP = {
+    "No Delay": 0.0,
+    "0.1 sec": 0.1,
+    "0.25 sec": 0.25,
+    "0.5 sec": 0.5,
+    "1 sec": 1.0,
+    "2 sec": 2.0,
+    "3 sec": 3.0
 }
 
 def load_config():
@@ -35,19 +49,22 @@ def load_config():
     config = configparser.ConfigParser()
     if os.path.exists(CONFIG_FILE):
         config.read(CONFIG_FILE)
-        if 'Hotkeys' in config:
-            hotkeys['mic'] = config['Hotkeys'].get('mic', hotkeys['mic'])
+        if 'Settings' in config:
+            settings['mic_hotkey'] = config['Settings'].get('mic_hotkey', settings['mic_hotkey'])
+            settings['delay_val'] = config['Settings'].get('delay_val', settings['delay_val'])
     else:
         save_config()
 
 def save_config():
     config = configparser.ConfigParser()
-    config['Hotkeys'] = hotkeys
+    config['Settings'] = settings
     with open(CONFIG_FILE, 'w') as configfile:
         config.write(configfile)
 
 # --- Global States ---
 is_mic_muted = False
+is_monitoring = False
+monitor_thread = None
 
 tray_icon = None
 app_ui = None
@@ -75,6 +92,93 @@ def toggle_mic():
     CoUninitialize()
     trigger_ui_update()
 
+# --- Audio Monitoring Thread ---
+
+def audio_monitor_loop():
+    CHUNK = 1024
+    RATE = 44100
+    p = pyaudio.PyAudio()
+    
+    try:
+        stream_in = p.open(format=pyaudio.paInt16, channels=1, rate=RATE, input=True, frames_per_buffer=CHUNK)
+        stream_out = p.open(format=pyaudio.paInt16, channels=1, rate=RATE, output=True, frames_per_buffer=CHUNK)
+    except Exception as e:
+        print(f"Failed to open audio streams: {e}")
+        p.terminate()
+        return
+
+    empty_chunk = b'\x00' * (CHUNK * 2) # 16-bit mono = 2 bytes per frame
+    buffer = collections.deque()
+    
+    # Get initial delay
+    current_delay_str = settings['delay_val']
+    
+    def get_target_chunks(delay_seconds):
+        return int((delay_seconds * RATE) / CHUNK)
+
+    target_chunks = get_target_chunks(DELAY_MAP.get(current_delay_str, 0.0))
+
+    while is_monitoring:
+        try:
+            # Read from mic
+            data = stream_in.read(CHUNK, exception_on_overflow=False)
+            
+            # Check if user changed the dropdown in the UI
+            new_delay_str = settings['delay_val']
+            if new_delay_str != current_delay_str:
+                current_delay_str = new_delay_str
+                target_chunks = get_target_chunks(DELAY_MAP.get(current_delay_str, 0.0))
+            
+            # Adjust buffer size dynamically
+            while len(buffer) < target_chunks:
+                buffer.append(empty_chunk)
+            while len(buffer) > target_chunks and len(buffer) > 0:
+                buffer.popleft()
+
+            # Process audio output based on delay
+            if target_chunks > 0:
+                buffer.append(data)
+                out_data = buffer.popleft()
+            else:
+                out_data = data
+                
+            # Write to speakers
+            stream_out.write(out_data)
+            
+        except Exception as e:
+            print(f"Audio stream error: {e}")
+            break
+
+    # Cleanup
+    stream_in.stop_stream()
+    stream_in.close()
+    stream_out.stop_stream()
+    stream_out.close()
+    p.terminate()
+
+def toggle_monitoring():
+    global is_monitoring, monitor_thread
+    
+    # If it was off, turn it on
+    if not is_monitoring:
+        is_monitoring = True
+        monitor_thread = threading.Thread(target=audio_monitor_loop, daemon=True)
+        monitor_thread.start()
+    # If it was on, turn it off
+    else:
+        is_monitoring = False
+        # Thread will exit on its next loop iteration naturally
+
+    if app_ui:
+        app_ui.btn_monitor.configure(
+            text="Stop Monitoring" if is_monitoring else "Start Monitoring",
+            fg_color=COLOR_LIVE if is_monitoring else "transparent"
+        )
+
+def update_delay(choice):
+    settings['delay_val'] = choice
+    save_config()
+
 # --- UI Sync Logic ---
 
 def trigger_ui_update():
@@ -88,27 +192,24 @@ def trigger_ui_update():
 def create_icon_image(mic_muted):
     image = Image.new('RGB', (64, 64))
     draw = ImageDraw.Draw(image)
-    
-    # Fill the entire icon based on mic status
     draw.rectangle([0, 0, 64, 64], fill=('red' if mic_muted else 'green'))
     return image
 
 # --- CustomTkinter GUI Application ---
 
 class HotkeyCatcher(ctk.CTkToplevel):
-    def __init__(self, parent, target_name):
+    def __init__(self, parent):
         super().__init__(parent)
         self.title("Listening...")
         self.geometry("380x160")
         self.resizable(False, False)
-        
         self.transient(parent)
         self.grab_set()
 
         self.result = None
         self.is_active = True
         
-        ctk.CTkLabel(self, text=f"Set Hotkey for {target_name.upper()}", font=ctk.CTkFont(size=16, weight="bold")).pack(pady=(25, 5))
+        ctk.CTkLabel(self, text="Set Hotkey for MIC", font=ctk.CTkFont(size=16, weight="bold")).pack(pady=(25, 5))
         ctk.CTkLabel(self, text="Press your new key combination now...\n(Press 'Esc' to cancel)", text_color="gray").pack()
         
         self.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -133,33 +234,56 @@ class VantageGUI:
         self.root = root
         self.root.title("VantageGuard")
         
-        # Adjusted geometry for a single row
-        self.root.geometry("540x150")
-        self.root.minsize(450, 120)
-        
+        # Increased height for the new monitoring row
+        self.root.geometry("540x240")
+        self.root.minsize(480, 240)
         self.root.protocol("WM_DELETE_WINDOW", self.hide_window)
 
         self.root.grid_columnconfigure(0, weight=1)
         self.root.grid_rowconfigure(0, weight=1)
+        self.root.grid_rowconfigure(1, weight=1)
 
+        # 1. Microphone Control Frame
         self.mic_frame = ctk.CTkFrame(self.root, corner_radius=10)
-        self.mic_frame.grid(row=0, column=0, padx=20, pady=20, sticky="nsew")
+        self.mic_frame.grid(row=0, column=0, padx=20, pady=(20, 10), sticky="nsew")
+        self.mic_frame.grid_columnconfigure(0, weight=1)
+        self.mic_frame.grid_rowconfigure(0, weight=1)
         
-        self._build_row(self.mic_frame, 'mic', toggle_mic)
+        self.lbl_mic_hotkey = ctk.CTkLabel(self.mic_frame, text=f"Mic Hotkey: {settings['mic_hotkey'].upper()}", font=ctk.CTkFont(weight="bold", size=14), text_color="white")
+        self.lbl_mic_hotkey.grid(row=0, column=0, padx=20, pady=15, sticky="w")
+        
+        ctk.CTkButton(self.mic_frame, text="Set Hotkey", width=100, fg_color="#333333", hover_color="#444444", command=self.set_hotkey).grid(row=0, column=1, padx=10, pady=15)
+        ctk.CTkButton(self.mic_frame, text="Toggle Mic", width=100, fg_color="transparent", border_width=2, text_color="white", command=toggle_mic).grid(row=0, column=2, padx=20, pady=15)
+
+        # 2. Live Audio Monitoring Frame
+        self.mon_frame = ctk.CTkFrame(self.root, corner_radius=10, fg_color=COLOR_NEUTRAL)
+        self.mon_frame.grid(row=1, column=0, padx=20, pady=(10, 20), sticky="nsew")
+        self.mon_frame.grid_columnconfigure(0, weight=1)
+        self.mon_frame.grid_rowconfigure(0, weight=1)
+
+        ctk.CTkLabel(self.mon_frame, text="Live Monitoring", font=ctk.CTkFont(weight="bold", size=14), text_color="white").grid(row=0, column=0, padx=20, pady=15, sticky="w")
+
+        self.delay_dropdown = ctk.CTkOptionMenu(
+            self.mon_frame, 
+            values=list(DELAY_MAP.keys()),
+            command=update_delay,
+            width=120
+        )
+        self.delay_dropdown.set(settings['delay_val'])
+        self.delay_dropdown.grid(row=0, column=1, padx=10, pady=15)
+
+        self.btn_monitor = ctk.CTkButton(
+            self.mon_frame, 
+            text="Start Monitoring", 
+            width=120, 
+            fg_color="transparent", 
+            border_width=2, 
+            text_color="white", 
+            command=toggle_monitoring
+        )
+        self.btn_monitor.grid(row=0, column=2, padx=20, pady=15)
 
         self.refresh_colors()
-
-    def _build_row(self, parent_frame, target, toggle_cmd):
-        parent_frame.grid_columnconfigure(0, weight=1)
-        parent_frame.grid_rowconfigure(0, weight=1)
-        
-        lbl = ctk.CTkLabel(parent_frame, text=f"Hotkey: {hotkeys[target].upper()}", font=ctk.CTkFont(weight="bold", size=14), text_color="white")
-        lbl.grid(row=0, column=0, padx=20, pady=15, sticky="w")
-        
-        self.lbl_mic_hotkey = lbl
-
-        ctk.CTkButton(parent_frame, text="Set Hotkey", width=100, fg_color="#333333", hover_color="#444444", command=lambda: self.set_hotkey(target)).grid(row=0, column=1, padx=10, pady=15)
-        ctk.CTkButton(parent_frame, text=f"Toggle {target.capitalize()}", width=100, fg_color="transparent", border_width=2, text_color="white", command=toggle_cmd).grid(row=0, column=2, padx=20, pady=15)
 
     def refresh_colors(self):
         self.mic_frame.configure(fg_color=COLOR_MUTED if is_mic_muted else COLOR_LIVE)
@@ -171,10 +295,9 @@ class VantageGUI:
         self.root.deiconify()
         self.root.lift()
 
-    def set_hotkey(self, target):
-        current = hotkeys[target]
-        
-        listener = HotkeyCatcher(self.root, target)
+    def set_hotkey(self):
+        current = settings['mic_hotkey']
+        listener = HotkeyCatcher(self.root)
         self.root.wait_window(listener)
         
         new_key = listener.result
@@ -184,9 +307,9 @@ class VantageGUI:
                 except ValueError: pass
                 
                 keyboard.add_hotkey(new_key, toggle_mic)
-                self.lbl_mic_hotkey.configure(text=f"Hotkey: {new_key.upper()}")
+                self.lbl_mic_hotkey.configure(text=f"Mic Hotkey: {new_key.upper()}")
                 
-                hotkeys[target] = new_key
+                settings['mic_hotkey'] = new_key
                 save_config()
                 
             except Exception as e:
@@ -195,6 +318,8 @@ class VantageGUI:
 # --- System Tray Setup ---
 
 def on_quit(icon, item):
+    global is_monitoring
+    is_monitoring = False # Stop audio thread
     icon.stop()
     if app_ui:
         app_ui.root.quit()
@@ -225,7 +350,7 @@ def main():
         is_mic_muted = mic.GetMute()
     CoUninitialize()
     
-    keyboard.add_hotkey(hotkeys['mic'], toggle_mic)
+    keyboard.add_hotkey(settings['mic_hotkey'], toggle_mic)
 
     threading.Thread(target=run_tray, daemon=True).start()
 
