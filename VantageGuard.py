@@ -92,6 +92,24 @@ def toggle_mic():
     CoUninitialize()
     trigger_ui_update()
 
+def get_mic_volume():
+    CoInitialize()
+    mic_volume = get_mic_endpoint()
+    vol = 1.0
+    if mic_volume:
+        vol = mic_volume.GetMasterVolumeLevelScalar()
+    CoUninitialize()
+    return vol
+
+def set_mic_volume(val):
+    CoInitialize()
+    mic_volume = get_mic_endpoint()
+    if mic_volume:
+        mic_volume.SetMasterVolumeLevelScalar(float(val), None)
+    CoUninitialize()
+    if app_ui:
+        app_ui.lbl_vol_val.configure(text=f"{int(float(val)*100)}%")
+
 # --- Audio Monitoring Thread ---
 
 def audio_monitor_loop():
@@ -107,10 +125,9 @@ def audio_monitor_loop():
         p.terminate()
         return
 
-    empty_chunk = b'\x00' * (CHUNK * 2) # 16-bit mono = 2 bytes per frame
+    empty_chunk = b'\x00' * (CHUNK * 2) 
     buffer = collections.deque()
     
-    # Get initial delay
     current_delay_str = settings['delay_val']
     
     def get_target_chunks(delay_seconds):
@@ -120,36 +137,30 @@ def audio_monitor_loop():
 
     while is_monitoring:
         try:
-            # Read from mic
             data = stream_in.read(CHUNK, exception_on_overflow=False)
             
-            # Check if user changed the dropdown in the UI
             new_delay_str = settings['delay_val']
             if new_delay_str != current_delay_str:
                 current_delay_str = new_delay_str
                 target_chunks = get_target_chunks(DELAY_MAP.get(current_delay_str, 0.0))
             
-            # Adjust buffer size dynamically
             while len(buffer) < target_chunks:
                 buffer.append(empty_chunk)
             while len(buffer) > target_chunks and len(buffer) > 0:
                 buffer.popleft()
 
-            # Process audio output based on delay
             if target_chunks > 0:
                 buffer.append(data)
                 out_data = buffer.popleft()
             else:
                 out_data = data
                 
-            # Write to speakers
             stream_out.write(out_data)
             
         except Exception as e:
             print(f"Audio stream error: {e}")
             break
 
-    # Cleanup
     stream_in.stop_stream()
     stream_in.close()
     stream_out.stop_stream()
@@ -159,15 +170,12 @@ def audio_monitor_loop():
 def toggle_monitoring():
     global is_monitoring, monitor_thread
     
-    # If it was off, turn it on
     if not is_monitoring:
         is_monitoring = True
         monitor_thread = threading.Thread(target=audio_monitor_loop, daemon=True)
         monitor_thread.start()
-    # If it was on, turn it off
     else:
         is_monitoring = False
-        # Thread will exit on its next loop iteration naturally
 
     if app_ui:
         app_ui.btn_monitor.configure(
@@ -234,16 +242,17 @@ class VantageGUI:
         self.root = root
         self.root.title("VantageGuard")
         
-        # Increased height for the new monitoring row
-        self.root.geometry("540x240")
-        self.root.minsize(480, 240)
+        # Increased height for three distinct frames
+        self.root.geometry("540x330")
+        self.root.minsize(480, 330)
         self.root.protocol("WM_DELETE_WINDOW", self.hide_window)
 
         self.root.grid_columnconfigure(0, weight=1)
         self.root.grid_rowconfigure(0, weight=1)
         self.root.grid_rowconfigure(1, weight=1)
+        self.root.grid_rowconfigure(2, weight=1)
 
-        # 1. Microphone Control Frame
+        # 1. Microphone Toggle Frame
         self.mic_frame = ctk.CTkFrame(self.root, corner_radius=10)
         self.mic_frame.grid(row=0, column=0, padx=20, pady=(20, 10), sticky="nsew")
         self.mic_frame.grid_columnconfigure(0, weight=1)
@@ -255,9 +264,23 @@ class VantageGUI:
         ctk.CTkButton(self.mic_frame, text="Set Hotkey", width=100, fg_color="#333333", hover_color="#444444", command=self.set_hotkey).grid(row=0, column=1, padx=10, pady=15)
         ctk.CTkButton(self.mic_frame, text="Toggle Mic", width=100, fg_color="transparent", border_width=2, text_color="white", command=toggle_mic).grid(row=0, column=2, padx=20, pady=15)
 
-        # 2. Live Audio Monitoring Frame
+        # 2. Microphone Volume Frame (Neutral Color)
+        self.vol_frame = ctk.CTkFrame(self.root, corner_radius=10, fg_color=COLOR_NEUTRAL)
+        self.vol_frame.grid(row=1, column=0, padx=20, pady=(10, 10), sticky="nsew")
+        self.vol_frame.grid_columnconfigure(0, weight=1)
+        self.vol_frame.grid_rowconfigure(0, weight=1)
+        
+        ctk.CTkLabel(self.vol_frame, text="Mic Volume:", font=ctk.CTkFont(weight="bold", size=14), text_color="white").grid(row=0, column=0, padx=20, pady=15, sticky="w")
+        
+        self.vol_slider = ctk.CTkSlider(self.vol_frame, from_=0.0, to=1.0, command=set_mic_volume)
+        self.vol_slider.grid(row=0, column=1, padx=10, pady=15, sticky="ew")
+        
+        self.lbl_vol_val = ctk.CTkLabel(self.vol_frame, text="100%", width=40, font=ctk.CTkFont(weight="bold"))
+        self.lbl_vol_val.grid(row=0, column=2, padx=20, pady=15, sticky="e")
+
+        # 3. Live Audio Monitoring Frame
         self.mon_frame = ctk.CTkFrame(self.root, corner_radius=10, fg_color=COLOR_NEUTRAL)
-        self.mon_frame.grid(row=1, column=0, padx=20, pady=(10, 20), sticky="nsew")
+        self.mon_frame.grid(row=2, column=0, padx=20, pady=(10, 20), sticky="nsew")
         self.mon_frame.grid_columnconfigure(0, weight=1)
         self.mon_frame.grid_rowconfigure(0, weight=1)
 
@@ -286,6 +309,7 @@ class VantageGUI:
         self.refresh_colors()
 
     def refresh_colors(self):
+        # Only the main mic toggle frame flashes colors now
         self.mic_frame.configure(fg_color=COLOR_MUTED if is_mic_muted else COLOR_LIVE)
 
     def hide_window(self):
@@ -344,6 +368,7 @@ def main():
     
     load_config()
     
+    # Initialize Mic State
     CoInitialize()
     mic = get_mic_endpoint()
     if mic:
@@ -354,8 +379,15 @@ def main():
 
     threading.Thread(target=run_tray, daemon=True).start()
 
+    # GUI Boot
     root = ctk.CTk()
     app_ui = VantageGUI(root)
+    
+    # Sync initial slider value
+    initial_vol = get_mic_volume()
+    app_ui.vol_slider.set(initial_vol)
+    app_ui.lbl_vol_val.configure(text=f"{int(initial_vol*100)}%")
+    
     root.mainloop()
 
 if __name__ == '__main__':
