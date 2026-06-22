@@ -66,6 +66,9 @@ is_mic_muted = False
 is_monitoring = False
 monitor_thread = None
 
+input_devices_map = {}
+current_test_device_idx = None
+
 tray_icon = None
 app_ui = None
 
@@ -110,6 +113,28 @@ def set_mic_volume(val):
     if app_ui:
         app_ui.lbl_vol_val.configure(text=f"{int(float(val)*100)}%")
 
+def get_input_devices():
+    """Scans for active microphone inputs using PyAudio."""
+    p = pyaudio.PyAudio()
+    devices = {"System Default": None}
+    try:
+        default_api_info = p.get_default_host_api_info()
+        default_api_index = default_api_info['index']
+        
+        for i in range(p.get_device_count()):
+            info = p.get_device_info_by_index(i)
+            # Only grab devices that have input channels and belong to the default host API
+            if info['maxInputChannels'] > 0 and info['hostApi'] == default_api_index:
+                name = info['name']
+                if name not in devices:
+                    devices[name] = i
+    except Exception as e:
+        print(f"Error enumerating devices: {e}")
+    finally:
+        p.terminate()
+        
+    return devices
+
 # --- Audio Monitoring Thread ---
 
 def audio_monitor_loop():
@@ -118,11 +143,23 @@ def audio_monitor_loop():
     p = pyaudio.PyAudio()
     
     try:
-        stream_in = p.open(format=pyaudio.paInt16, channels=1, rate=RATE, input=True, frames_per_buffer=CHUNK)
-        stream_out = p.open(format=pyaudio.paInt16, channels=1, rate=RATE, output=True, frames_per_buffer=CHUNK)
+        stream_in = p.open(format=pyaudio.paInt16, 
+                           channels=1, 
+                           rate=RATE, 
+                           input=True, 
+                           input_device_index=current_test_device_idx,
+                           frames_per_buffer=CHUNK)
+                           
+        stream_out = p.open(format=pyaudio.paInt16, 
+                            channels=1, 
+                            rate=RATE, 
+                            output=True, 
+                            frames_per_buffer=CHUNK)
     except Exception as e:
         print(f"Failed to open audio streams: {e}")
         p.terminate()
+        if app_ui:
+            app_ui.root.after(0, force_stop_monitoring)
         return
 
     empty_chunk = b'\x00' * (CHUNK * 2) 
@@ -167,6 +204,12 @@ def audio_monitor_loop():
     stream_out.close()
     p.terminate()
 
+def force_stop_monitoring():
+    global is_monitoring
+    is_monitoring = False
+    if app_ui:
+        app_ui.btn_monitor.configure(text="Start Monitoring", fg_color="transparent")
+
 def toggle_monitoring():
     global is_monitoring, monitor_thread
     
@@ -186,6 +229,15 @@ def toggle_monitoring():
 def update_delay(choice):
     settings['delay_val'] = choice
     save_config()
+
+def update_test_device(choice):
+    global current_test_device_idx
+    current_test_device_idx = input_devices_map.get(choice)
+    
+    # If currently monitoring, restart the feed to apply the new mic
+    if is_monitoring:
+        toggle_monitoring() # Turn off
+        app_ui.root.after(400, toggle_monitoring) # Wait a beat for the thread to close, then turn back on
 
 # --- UI Sync Logic ---
 
@@ -242,9 +294,9 @@ class VantageGUI:
         self.root = root
         self.root.title("VantageGuard")
         
-        # Increased height for three distinct frames
-        self.root.geometry("540x330")
-        self.root.minsize(480, 330)
+        # Taller window to fit the new device row
+        self.root.geometry("540x390")
+        self.root.minsize(480, 390)
         self.root.protocol("WM_DELETE_WINDOW", self.hide_window)
 
         self.root.grid_columnconfigure(0, weight=1)
@@ -264,7 +316,7 @@ class VantageGUI:
         ctk.CTkButton(self.mic_frame, text="Set Hotkey", width=100, fg_color="#333333", hover_color="#444444", command=self.set_hotkey).grid(row=0, column=1, padx=10, pady=15)
         ctk.CTkButton(self.mic_frame, text="Toggle Mic", width=100, fg_color="transparent", border_width=2, text_color="white", command=toggle_mic).grid(row=0, column=2, padx=20, pady=15)
 
-        # 2. Microphone Volume Frame (Neutral Color)
+        # 2. Microphone Volume Frame
         self.vol_frame = ctk.CTkFrame(self.root, corner_radius=10, fg_color=COLOR_NEUTRAL)
         self.vol_frame.grid(row=1, column=0, padx=20, pady=(10, 10), sticky="nsew")
         self.vol_frame.grid_columnconfigure(0, weight=1)
@@ -283,8 +335,10 @@ class VantageGUI:
         self.mon_frame.grid(row=2, column=0, padx=20, pady=(10, 20), sticky="nsew")
         self.mon_frame.grid_columnconfigure(0, weight=1)
         self.mon_frame.grid_rowconfigure(0, weight=1)
+        self.mon_frame.grid_rowconfigure(1, weight=1)
 
-        ctk.CTkLabel(self.mon_frame, text="Live Monitoring", font=ctk.CTkFont(weight="bold", size=14), text_color="white").grid(row=0, column=0, padx=20, pady=15, sticky="w")
+        # Row 0: Monitoring Controls
+        ctk.CTkLabel(self.mon_frame, text="Live Monitoring", font=ctk.CTkFont(weight="bold", size=14), text_color="white").grid(row=0, column=0, padx=20, pady=(15, 5), sticky="w")
 
         self.delay_dropdown = ctk.CTkOptionMenu(
             self.mon_frame, 
@@ -293,7 +347,7 @@ class VantageGUI:
             width=120
         )
         self.delay_dropdown.set(settings['delay_val'])
-        self.delay_dropdown.grid(row=0, column=1, padx=10, pady=15)
+        self.delay_dropdown.grid(row=0, column=1, padx=10, pady=(15, 5))
 
         self.btn_monitor = ctk.CTkButton(
             self.mon_frame, 
@@ -304,12 +358,23 @@ class VantageGUI:
             text_color="white", 
             command=toggle_monitoring
         )
-        self.btn_monitor.grid(row=0, column=2, padx=20, pady=15)
+        self.btn_monitor.grid(row=0, column=2, padx=20, pady=(15, 5))
+
+        # Row 1: Device Testing Dropdown
+        ctk.CTkLabel(self.mon_frame, text="Test Device:", font=ctk.CTkFont(weight="bold", size=14), text_color="white").grid(row=1, column=0, padx=20, pady=(5, 15), sticky="w")
+        
+        self.device_dropdown = ctk.CTkOptionMenu(
+            self.mon_frame,
+            values=list(input_devices_map.keys()),
+            command=update_test_device
+        )
+        self.device_dropdown.set("System Default")
+        # Span across the last two columns to give long device names room to breathe
+        self.device_dropdown.grid(row=1, column=1, columnspan=2, padx=10, pady=(5, 15), sticky="ew")
 
         self.refresh_colors()
 
     def refresh_colors(self):
-        # Only the main mic toggle frame flashes colors now
         self.mic_frame.configure(fg_color=COLOR_MUTED if is_mic_muted else COLOR_LIVE)
 
     def hide_window(self):
@@ -364,7 +429,7 @@ def run_tray():
 # --- Main Boot Sequence ---
 
 def main():
-    global is_mic_muted, app_ui
+    global is_mic_muted, app_ui, input_devices_map
     
     load_config()
     
@@ -374,6 +439,9 @@ def main():
     if mic:
         is_mic_muted = mic.GetMute()
     CoUninitialize()
+    
+    # Pre-load available audio devices before booting GUI
+    input_devices_map = get_input_devices()
     
     keyboard.add_hotkey(settings['mic_hotkey'], toggle_mic)
 
