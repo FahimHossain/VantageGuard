@@ -9,6 +9,8 @@ import configparser
 import os
 import pyaudio
 import collections
+import struct
+import time
 from PIL import Image, ImageDraw
 from ctypes import cast, POINTER
 from comtypes import CLSCTX_ALL, CoInitialize, CoUninitialize
@@ -22,6 +24,7 @@ ctk.set_default_color_theme("blue")
 COLOR_LIVE = "#2A8C55"  # Soft Green
 COLOR_MUTED = "#C64747" # Soft Red
 COLOR_NEUTRAL = "#2B2B2B"
+COLOR_CANVAS = "#1E1E1E"
 
 # --- Configuration & File Handling ---
 CONFIG_DIR = os.path.join(os.getenv('APPDATA'), 'VantageGuard')
@@ -64,10 +67,10 @@ def save_config():
 # --- Global States ---
 is_mic_muted = False
 is_monitoring = False
-monitor_thread = None
-
-input_devices_map = {}
 current_test_device_idx = None
+input_devices_map = {}
+
+current_waveform = [] # Holds the data for the visualizer
 
 tray_icon = None
 app_ui = None
@@ -114,7 +117,6 @@ def set_mic_volume(val):
         app_ui.lbl_vol_val.configure(text=f"{int(float(val)*100)}%")
 
 def get_input_devices():
-    """Scans for active microphone inputs using PyAudio."""
     p = pyaudio.PyAudio()
     devices = {"System Default": None}
     try:
@@ -123,102 +125,89 @@ def get_input_devices():
         
         for i in range(p.get_device_count()):
             info = p.get_device_info_by_index(i)
-            # Only grab devices that have input channels and belong to the default host API
             if info['maxInputChannels'] > 0 and info['hostApi'] == default_api_index:
-                name = info['name']
-                if name not in devices:
-                    devices[name] = i
+                devices[info['name']] = i
     except Exception as e:
         print(f"Error enumerating devices: {e}")
     finally:
         p.terminate()
-        
     return devices
 
-# --- Audio Monitoring Thread ---
+# --- Continuous Audio Engine ---
 
-def audio_monitor_loop():
+def audio_engine_loop():
+    """Constantly runs to power the visualizer, selectively routes audio for monitoring."""
+    global current_waveform
     CHUNK = 1024
     RATE = 44100
     p = pyaudio.PyAudio()
     
-    try:
-        stream_in = p.open(format=pyaudio.paInt16, 
-                           channels=1, 
-                           rate=RATE, 
-                           input=True, 
-                           input_device_index=current_test_device_idx,
-                           frames_per_buffer=CHUNK)
-                           
-        stream_out = p.open(format=pyaudio.paInt16, 
-                            channels=1, 
-                            rate=RATE, 
-                            output=True, 
-                            frames_per_buffer=CHUNK)
-    except Exception as e:
-        print(f"Failed to open audio streams: {e}")
-        p.terminate()
-        if app_ui:
-            app_ui.root.after(0, force_stop_monitoring)
-        return
-
-    empty_chunk = b'\x00' * (CHUNK * 2) 
-    buffer = collections.deque()
-    
-    current_delay_str = settings['delay_val']
-    
-    def get_target_chunks(delay_seconds):
-        return int((delay_seconds * RATE) / CHUNK)
-
-    target_chunks = get_target_chunks(DELAY_MAP.get(current_delay_str, 0.0))
-
-    while is_monitoring:
+    while True: # Outer loop allows us to cleanly restart if the user changes the input device
+        active_device = current_test_device_idx
+        
         try:
-            data = stream_in.read(CHUNK, exception_on_overflow=False)
-            
-            new_delay_str = settings['delay_val']
-            if new_delay_str != current_delay_str:
-                current_delay_str = new_delay_str
-                target_chunks = get_target_chunks(DELAY_MAP.get(current_delay_str, 0.0))
-            
-            while len(buffer) < target_chunks:
-                buffer.append(empty_chunk)
-            while len(buffer) > target_chunks and len(buffer) > 0:
-                buffer.popleft()
+            stream_in = p.open(format=pyaudio.paInt16, channels=1, rate=RATE, input=True, 
+                               input_device_index=active_device, frames_per_buffer=CHUNK)
+            stream_out = p.open(format=pyaudio.paInt16, channels=1, rate=RATE, output=True, 
+                                frames_per_buffer=CHUNK)
+        except Exception:
+            time.sleep(1)
+            continue
 
-            if target_chunks > 0:
-                buffer.append(data)
-                out_data = buffer.popleft()
-            else:
-                out_data = data
+        empty_chunk = b'\x00' * (CHUNK * 2)
+        buffer = collections.deque()
+        current_delay_str = settings['delay_val']
+        
+        def get_target_chunks(delay_seconds):
+            return int((delay_seconds * RATE) / CHUNK)
+
+        target_chunks = get_target_chunks(DELAY_MAP.get(current_delay_str, 0.0))
+
+        # Inner loop reads data as long as the device hasn't been changed
+        while active_device == current_test_device_idx:
+            try:
+                data = stream_in.read(CHUNK, exception_on_overflow=False)
                 
-            stream_out.write(out_data)
-            
-        except Exception as e:
-            print(f"Audio stream error: {e}")
-            break
+                # --- Visualizer Data Processing ---
+                if len(data) == CHUNK * 2:
+                    samples = struct.unpack(f"{CHUNK}h", data)
+                    # Downsample 1024 points to ~64 points so Tkinter can draw it fast
+                    step = CHUNK // 64
+                    current_waveform = [samples[i] for i in range(0, CHUNK, step)]
 
-    stream_in.stop_stream()
-    stream_in.close()
-    stream_out.stop_stream()
-    stream_out.close()
-    p.terminate()
+                # --- Live Monitoring Routing ---
+                if is_monitoring:
+                    new_delay_str = settings['delay_val']
+                    if new_delay_str != current_delay_str:
+                        current_delay_str = new_delay_str
+                        target_chunks = get_target_chunks(DELAY_MAP.get(current_delay_str, 0.0))
+                    
+                    while len(buffer) < target_chunks:
+                        buffer.append(empty_chunk)
+                    while len(buffer) > target_chunks and len(buffer) > 0:
+                        buffer.popleft()
 
-def force_stop_monitoring():
-    global is_monitoring
-    is_monitoring = False
-    if app_ui:
-        app_ui.btn_monitor.configure(text="Start Monitoring", fg_color="transparent")
+                    if target_chunks > 0:
+                        buffer.append(data)
+                        out_data = buffer.popleft()
+                    else:
+                        out_data = data
+                        
+                    stream_out.write(out_data)
+                else:
+                    buffer.clear() # Keep buffer empty when not monitoring
+                    
+            except Exception:
+                break # Stream crash, break to outer loop to reboot the streams
+
+        stream_in.stop_stream()
+        stream_in.close()
+        stream_out.stop_stream()
+        stream_out.close()
 
 def toggle_monitoring():
-    global is_monitoring, monitor_thread
-    
-    if not is_monitoring:
-        is_monitoring = True
-        monitor_thread = threading.Thread(target=audio_monitor_loop, daemon=True)
-        monitor_thread.start()
-    else:
-        is_monitoring = False
+    global is_monitoring
+    is_monitoring = not is_monitoring
 
     if app_ui:
         app_ui.btn_monitor.configure(
@@ -232,12 +221,8 @@ def update_delay(choice):
 
 def update_test_device(choice):
     global current_test_device_idx
+    # This change breaks the while loop in the audio thread, forcing it to cleanly restart with the new device
     current_test_device_idx = input_devices_map.get(choice)
-    
-    # If currently monitoring, restart the feed to apply the new mic
-    if is_monitoring:
-        toggle_monitoring() # Turn off
-        app_ui.root.after(400, toggle_monitoring) # Wait a beat for the thread to close, then turn back on
 
 # --- UI Sync Logic ---
 
@@ -294,15 +279,16 @@ class VantageGUI:
         self.root = root
         self.root.title("VantageGuard")
         
-        # Taller window to fit the new device row
-        self.root.geometry("540x390")
-        self.root.minsize(480, 390)
+        # Taller window to fit the visualizer frame
+        self.root.geometry("600x700")
+        self.root.minsize(480, 480)
         self.root.protocol("WM_DELETE_WINDOW", self.hide_window)
 
         self.root.grid_columnconfigure(0, weight=1)
         self.root.grid_rowconfigure(0, weight=1)
         self.root.grid_rowconfigure(1, weight=1)
         self.root.grid_rowconfigure(2, weight=1)
+        self.root.grid_rowconfigure(3, weight=1)
 
         # 1. Microphone Toggle Frame
         self.mic_frame = ctk.CTkFrame(self.root, corner_radius=10)
@@ -332,50 +318,70 @@ class VantageGUI:
 
         # 3. Live Audio Monitoring Frame
         self.mon_frame = ctk.CTkFrame(self.root, corner_radius=10, fg_color=COLOR_NEUTRAL)
-        self.mon_frame.grid(row=2, column=0, padx=20, pady=(10, 20), sticky="nsew")
+        self.mon_frame.grid(row=2, column=0, padx=20, pady=(10, 10), sticky="nsew")
         self.mon_frame.grid_columnconfigure(0, weight=1)
-        self.mon_frame.grid_rowconfigure(0, weight=1)
-        self.mon_frame.grid_rowconfigure(1, weight=1)
-
-        # Row 0: Monitoring Controls
+        
         ctk.CTkLabel(self.mon_frame, text="Live Monitoring", font=ctk.CTkFont(weight="bold", size=14), text_color="white").grid(row=0, column=0, padx=20, pady=(15, 5), sticky="w")
 
-        self.delay_dropdown = ctk.CTkOptionMenu(
-            self.mon_frame, 
-            values=list(DELAY_MAP.keys()),
-            command=update_delay,
-            width=120
-        )
+        self.delay_dropdown = ctk.CTkOptionMenu(self.mon_frame, values=list(DELAY_MAP.keys()), command=update_delay, width=120)
         self.delay_dropdown.set(settings['delay_val'])
         self.delay_dropdown.grid(row=0, column=1, padx=10, pady=(15, 5))
 
-        self.btn_monitor = ctk.CTkButton(
-            self.mon_frame, 
-            text="Start Monitoring", 
-            width=120, 
-            fg_color="transparent", 
-            border_width=2, 
-            text_color="white", 
-            command=toggle_monitoring
-        )
+        self.btn_monitor = ctk.CTkButton(self.mon_frame, text="Start Monitoring", width=120, fg_color="transparent", border_width=2, text_color="white", command=toggle_monitoring)
         self.btn_monitor.grid(row=0, column=2, padx=20, pady=(15, 5))
 
-        # Row 1: Device Testing Dropdown
         ctk.CTkLabel(self.mon_frame, text="Test Device:", font=ctk.CTkFont(weight="bold", size=14), text_color="white").grid(row=1, column=0, padx=20, pady=(5, 15), sticky="w")
-        
-        self.device_dropdown = ctk.CTkOptionMenu(
-            self.mon_frame,
-            values=list(input_devices_map.keys()),
-            command=update_test_device
-        )
+        self.device_dropdown = ctk.CTkOptionMenu(self.mon_frame, values=list(input_devices_map.keys()), command=update_test_device)
         self.device_dropdown.set("System Default")
-        # Span across the last two columns to give long device names room to breathe
         self.device_dropdown.grid(row=1, column=1, columnspan=2, padx=10, pady=(5, 15), sticky="ew")
 
+        # 4. Waveform Visualizer Frame
+        self.vis_frame = ctk.CTkFrame(self.root, corner_radius=10, fg_color=COLOR_CANVAS)
+        self.vis_frame.grid(row=3, column=0, padx=20, pady=(10, 20), sticky="nsew")
+        
+        # We pack the canvas inside its dedicated frame
+        self.canvas = tk.Canvas(self.vis_frame, bg=COLOR_CANVAS, highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True, padx=10, pady=10)
+
         self.refresh_colors()
+        self.draw_waveform() # Kick off the rendering loop
 
     def refresh_colors(self):
         self.mic_frame.configure(fg_color=COLOR_MUTED if is_mic_muted else COLOR_LIVE)
+
+    def draw_waveform(self):
+        # Only spend CPU drawing if the window is actually visible
+        if self.root.winfo_exists() and self.root.state() == "normal":
+            self.canvas.delete("wave")
+            
+            width = int(self.canvas.winfo_width())
+            height = int(self.canvas.winfo_height())
+            
+            if width > 10 and height > 10: # Ensure canvas is rendered
+                mid_y = height / 2
+                data = current_waveform 
+                
+                if data and len(data) > 1:
+                    points = []
+                    x_step = width / (len(data) - 1)
+                    
+                    for i, val in enumerate(data):
+                        x = i * x_step
+                        # Convert 16-bit PCM integer (-32768 to 32767) to canvas Y coordinate
+                        y = mid_y - (val / 32768.0) * mid_y
+                        y = max(0, min(height, y)) # Clamp to boundaries
+                        points.extend([x, y])
+                    
+                    # Waveform matches system status (Red if muted, Green if live)
+                    line_color = COLOR_MUTED if is_mic_muted else COLOR_LIVE
+                    self.canvas.create_line(*points, fill=line_color, width=2, tags="wave", smooth=True)
+                else:
+                    # Draw flatline if no data
+                    line_color = COLOR_MUTED if is_mic_muted else COLOR_LIVE
+                    self.canvas.create_line(0, mid_y, width, mid_y, fill=line_color, width=2, tags="wave")
+                    
+        # Request next frame (~25 fps)
+        self.root.after(40, self.draw_waveform)
 
     def hide_window(self):
         self.root.withdraw()
@@ -407,8 +413,6 @@ class VantageGUI:
 # --- System Tray Setup ---
 
 def on_quit(icon, item):
-    global is_monitoring
-    is_monitoring = False # Stop audio thread
     icon.stop()
     if app_ui:
         app_ui.root.quit()
@@ -433,25 +437,24 @@ def main():
     
     load_config()
     
-    # Initialize Mic State
     CoInitialize()
     mic = get_mic_endpoint()
     if mic:
         is_mic_muted = mic.GetMute()
     CoUninitialize()
     
-    # Pre-load available audio devices before booting GUI
     input_devices_map = get_input_devices()
     
     keyboard.add_hotkey(settings['mic_hotkey'], toggle_mic)
 
+    # Boot background services
+    threading.Thread(target=audio_engine_loop, daemon=True).start()
     threading.Thread(target=run_tray, daemon=True).start()
 
-    # GUI Boot
+    # Boot GUI
     root = ctk.CTk()
     app_ui = VantageGUI(root)
     
-    # Sync initial slider value
     initial_vol = get_mic_volume()
     app_ui.vol_slider.set(initial_vol)
     app_ui.lbl_vol_val.configure(text=f"{int(initial_vol*100)}%")
