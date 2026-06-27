@@ -12,6 +12,7 @@ import collections
 import struct
 import time
 import subprocess
+import wave
 from PIL import Image, ImageDraw
 from ctypes import cast, POINTER
 from comtypes import CLSCTX_ALL, CoInitialize, CoUninitialize
@@ -30,6 +31,7 @@ COLOR_CANVAS = "#1E1E1E"
 # --- Configuration & File Handling ---
 CONFIG_DIR = os.path.join(os.getenv('APPDATA'), 'VantageGuard')
 CONFIG_FILE = os.path.join(CONFIG_DIR, 'config.ini')
+RECORD_DIR = os.path.join(os.path.expanduser('~'), 'Documents', 'VantageGuard_Recordings')
 
 settings = {
     'mic_hotkey': 'f22',
@@ -72,6 +74,11 @@ current_test_device_idx = None
 input_devices_map = {}
 
 current_waveform = []
+
+# Recording States
+is_recording = False
+is_recording_paused = False
+recorded_frames = []
 
 tray_icon = None
 app_ui = None
@@ -137,7 +144,7 @@ def get_input_devices():
 # --- Continuous Audio Engine ---
 
 def audio_engine_loop():
-    global current_waveform
+    global current_waveform, recorded_frames
     CHUNK = 1024
     RATE = 44100
     p = pyaudio.PyAudio()
@@ -168,9 +175,14 @@ def audio_engine_loop():
                 data = stream_in.read(CHUNK, exception_on_overflow=False)
                 
                 if len(data) == CHUNK * 2:
+                    # Waveform Processing
                     samples = struct.unpack(f"{CHUNK}h", data)
                     step = CHUNK // 64
                     current_waveform = [samples[i] for i in range(0, CHUNK, step)]
+
+                    # Audio Recording Injection
+                    if is_recording and not is_recording_paused:
+                        recorded_frames.append(data)
 
                 if is_monitoring:
                     new_delay_str = settings['delay_val']
@@ -275,9 +287,9 @@ class VantageGUI:
         self.root = root
         self.root.title("VantageGuard")
         
-        # Slightly wider window to fit all the new buttons comfortably
-        self.root.geometry("640x510")
-        self.root.minsize(600, 510)
+        # Widened to comfortably fit the split row 2 design
+        self.root.geometry("740x510")
+        self.root.minsize(720, 510)
         self.root.protocol("WM_DELETE_WINDOW", self.hide_window)
 
         self.root.grid_columnconfigure(0, weight=1)
@@ -295,78 +307,74 @@ class VantageGUI:
         self.mic_frame.grid_columnconfigure(2, weight=0)
         self.mic_frame.grid_rowconfigure(0, weight=1)
         
-        # Hotkey Container (Label + Clickable Text/Entry)
         self.hotkey_container = ctk.CTkFrame(self.mic_frame, fg_color="transparent")
         self.hotkey_container.grid(row=0, column=0, padx=20, pady=15, sticky="w")
         
         ctk.CTkLabel(self.hotkey_container, text="Mic Hotkey: ", font=ctk.CTkFont(weight="bold", size=14), text_color="white").grid(row=0, column=0)
         
-        # Clickable hotkey text
         self.lbl_hotkey_text = ctk.CTkLabel(self.hotkey_container, text=settings['mic_hotkey'].upper(), font=ctk.CTkFont(weight="bold", size=14, underline=True), text_color="#FFFFFF", cursor="hand2")
         self.lbl_hotkey_text.grid(row=0, column=1, padx=(5, 0))
         self.lbl_hotkey_text.bind("<Button-1>", self.edit_hotkey)
         
-        # Hidden Entry field for typing the hotkey
         self.entry_hotkey = ctk.CTkEntry(self.hotkey_container, width=200, font=ctk.CTkFont(weight="bold", size=14))
         self.entry_hotkey.bind("<Return>", self.save_typed_hotkey)
         self.entry_hotkey.bind("<FocusOut>", self.save_typed_hotkey)
         
-        # Record Key Button (Popup)
-        self.btn_listen = ctk.CTkButton(
-            self.mic_frame, 
-            text="Record Key", 
-            width=90, 
-            height=40, 
-            font=ctk.CTkFont(size=14, weight="normal"), 
-            fg_color="transparent", 
-            hover_color="#307E53", 
-            command=self.set_hotkey_popup
-        )
+        self.btn_listen = ctk.CTkButton(self.mic_frame, text="Record Key", width=90, height=40, font=ctk.CTkFont(size=14, weight="normal"), fg_color="transparent", hover_color="#307E53", command=self.set_hotkey_popup)
         self.btn_listen.grid(row=0, column=1, padx=10, pady=15)
 
-        # Larger Toggle Button
-        self.btn_toggle = ctk.CTkButton(
-            self.mic_frame, 
-            text="Toggle Mic", 
-            width=120, 
-            height=40, 
-            font=ctk.CTkFont(size=14, weight="bold"), 
-            fg_color="transparent", 
-            border_width=2, 
-            text_color="white", 
-            command=toggle_mic
-        )
+        self.btn_toggle = ctk.CTkButton(self.mic_frame, text="Toggle Mic", width=120, height=40, font=ctk.CTkFont(size=14, weight="bold"), fg_color="transparent", border_width=2, text_color="white", command=toggle_mic)
         self.btn_toggle.grid(row=0, column=2, padx=20, pady=15, sticky="e")
 
-        # 2. Microphone Volume Frame
-        self.vol_frame = ctk.CTkFrame(self.root, corner_radius=10, fg_color=COLOR_NEUTRAL)
-        self.vol_frame.grid(row=1, column=0, padx=20, pady=(10, 10), sticky="nsew")
+        # 2. Split Row Container (Recorder + Volume)
+        self.middle_container = ctk.CTkFrame(self.root, fg_color="transparent")
+        self.middle_container.grid(row=1, column=0, padx=20, pady=(10, 10), sticky="nsew")
+        self.middle_container.grid_columnconfigure(0, weight=1)
+        self.middle_container.grid_columnconfigure(1, weight=1)
+
+        # 2a. Recorder Frame (Left)
+        self.rec_frame = ctk.CTkFrame(self.middle_container, corner_radius=10, fg_color=COLOR_NEUTRAL)
+        self.rec_frame.grid(row=0, column=0, padx=(0, 10), sticky="nsew")
+        self.rec_frame.grid_columnconfigure(0, weight=1)
+        self.rec_frame.grid_columnconfigure(1, weight=0)
+        self.rec_frame.grid_columnconfigure(2, weight=0)
+        self.rec_frame.grid_columnconfigure(3, weight=0)
+        self.rec_frame.grid_columnconfigure(4, weight=0)
+        self.rec_frame.grid_rowconfigure(0, weight=1)
+
+        ctk.CTkLabel(self.rec_frame, text="Recorder:", font=ctk.CTkFont(weight="bold", size=14), text_color="white").grid(row=0, column=0, padx=15, pady=15, sticky="w")
+        
+        self.btn_rec = ctk.CTkButton(self.rec_frame, text="⏺", width=35, height=35, font=ctk.CTkFont(size=18), fg_color="#333333", hover_color="#444444", command=self.action_record)
+        self.btn_rec.grid(row=0, column=1, padx=5, pady=15)
+        
+        self.btn_pause = ctk.CTkButton(self.rec_frame, text="⏸", width=35, height=35, font=ctk.CTkFont(size=18), fg_color="#222222", hover_color="#444444", state="disabled", command=self.action_pause)
+        self.btn_pause.grid(row=0, column=2, padx=5, pady=15)
+
+        self.btn_stop = ctk.CTkButton(self.rec_frame, text="⏹", width=35, height=35, font=ctk.CTkFont(size=18), fg_color="#222222", hover_color="#444444", state="disabled", command=self.action_stop)
+        self.btn_stop.grid(row=0, column=3, padx=5, pady=15)
+        
+        self.btn_folder = ctk.CTkButton(self.rec_frame, text="📁", width=35, height=35, font=ctk.CTkFont(size=18), fg_color="#333333", hover_color="#444444", command=self.action_folder)
+        self.btn_folder.grid(row=0, column=4, padx=(5, 15), pady=15)
+
+        # 2b. Microphone Volume Frame (Right)
+        self.vol_frame = ctk.CTkFrame(self.middle_container, corner_radius=10, fg_color=COLOR_NEUTRAL)
+        self.vol_frame.grid(row=0, column=1, padx=(10, 0), sticky="nsew")
         self.vol_frame.grid_columnconfigure(0, weight=0)
         self.vol_frame.grid_columnconfigure(1, weight=1)
         self.vol_frame.grid_columnconfigure(2, weight=0)
         self.vol_frame.grid_columnconfigure(3, weight=0)
         self.vol_frame.grid_rowconfigure(0, weight=1)
         
-        ctk.CTkLabel(self.vol_frame, text="Mic Volume:", font=ctk.CTkFont(weight="bold", size=14), text_color="white").grid(row=0, column=0, padx=20, pady=15, sticky="w")
+        ctk.CTkLabel(self.vol_frame, text="Vol:", font=ctk.CTkFont(weight="bold", size=14), text_color="white").grid(row=0, column=0, padx=15, pady=15, sticky="w")
         
         self.vol_slider = ctk.CTkSlider(self.vol_frame, from_=0.0, to=1.0, command=set_mic_volume)
-        self.vol_slider.grid(row=0, column=1, padx=10, pady=15, sticky="ew")
+        self.vol_slider.grid(row=0, column=1, padx=5, pady=15, sticky="ew")
         
         self.lbl_vol_val = ctk.CTkLabel(self.vol_frame, text="100%", width=40, font=ctk.CTkFont(weight="bold"))
-        self.lbl_vol_val.grid(row=0, column=2, padx=(10, 5), pady=15, sticky="e")
+        self.lbl_vol_val.grid(row=0, column=2, padx=(5, 5), pady=15, sticky="e")
 
-        # Windows Sound Settings Button
-        self.btn_settings = ctk.CTkButton(
-            self.vol_frame, 
-            text="⚙️", 
-            width=40, 
-            height=30, 
-            font=ctk.CTkFont(weight="bold"), 
-            fg_color="#333333", 
-            hover_color="#444444", 
-            command=self.open_sys_settings
-        )
-        self.btn_settings.grid(row=0, column=3, padx=(10, 20), pady=15, sticky="e")
+        self.btn_settings = ctk.CTkButton(self.vol_frame, text="⚙️", width=35, height=35, font=ctk.CTkFont(weight="bold"), fg_color="#333333", hover_color="#444444", command=self.open_sys_settings)
+        self.btn_settings.grid(row=0, column=3, padx=(5, 15), pady=15, sticky="e")
 
         # 3. Live Audio Monitoring Frame
         self.mon_frame = ctk.CTkFrame(self.root, corner_radius=10, fg_color=COLOR_NEUTRAL)
@@ -397,8 +405,64 @@ class VantageGUI:
         self.refresh_colors()
         self.draw_waveform() 
 
+    # --- Recorder Logic ---
+
+    def action_record(self):
+        global is_recording, is_recording_paused, recorded_frames
+        if not is_recording:
+            is_recording = True
+            is_recording_paused = False
+            recorded_frames = []
+            if not os.path.exists(RECORD_DIR):
+                os.makedirs(RECORD_DIR)
+            
+            self.btn_rec.configure(fg_color=COLOR_MUTED, hover_color="#A33A3A")
+            self.btn_pause.configure(state="normal", text="⏸", fg_color="#333333")
+            self.btn_stop.configure(state="normal", fg_color="#333333")
+
+    def action_pause(self):
+        global is_recording_paused
+        if is_recording:
+            is_recording_paused = not is_recording_paused
+            if is_recording_paused:
+                self.btn_pause.configure(text="▶", fg_color="#555555")
+            else:
+                self.btn_pause.configure(text="⏸", fg_color="#333333")
+
+    def action_stop(self):
+        global is_recording, is_recording_paused, recorded_frames
+        if is_recording:
+            is_recording = False
+            is_recording_paused = False
+            
+            self.btn_rec.configure(fg_color="#333333", hover_color="#444444")
+            self.btn_pause.configure(state="disabled", text="⏸", fg_color="#222222")
+            self.btn_stop.configure(state="disabled", fg_color="#222222")
+            
+            if recorded_frames:
+                filename = os.path.join(RECORD_DIR, f"Recording_{int(time.time())}.wav")
+                frames_copy = list(recorded_frames)
+                threading.Thread(target=self.save_recording, args=(frames_copy, filename), daemon=True).start()
+
+    def save_recording(self, frames, filename):
+        try:
+            wf = wave.open(filename, 'wb')
+            wf.setnchannels(1)
+            wf.setsampwidth(2) # paInt16
+            wf.setframerate(44100)
+            wf.writeframes(b''.join(frames))
+            wf.close()
+        except Exception as e:
+            print(f"Error saving recording: {e}")
+
+    def action_folder(self):
+        if not os.path.exists(RECORD_DIR):
+            os.makedirs(RECORD_DIR)
+        os.startfile(RECORD_DIR)
+
+    # --- UI Logic ---
+
     def edit_hotkey(self, event):
-        """Hides the label and shows the entry field to type a new hotkey."""
         self.lbl_hotkey_text.grid_forget()
         self.entry_hotkey.grid(row=0, column=1, padx=(5, 0))
         self.entry_hotkey.delete(0, 'end')
@@ -406,7 +470,6 @@ class VantageGUI:
         self.entry_hotkey.focus()
 
     def save_typed_hotkey(self, event=None):
-        """Saves the typed hotkey, validates it with keyboard library, and swaps back to the label."""
         if not self.entry_hotkey.winfo_ismapped():
             return 
             
@@ -431,7 +494,6 @@ class VantageGUI:
         self.lbl_hotkey_text.grid(row=0, column=1, padx=(5, 0))
 
     def set_hotkey_popup(self):
-        """Opens the listening popup to detect keypresses automatically."""
         current = settings['mic_hotkey']
         listener = HotkeyCatcher(self.root)
         self.root.wait_window(listener)
@@ -454,7 +516,6 @@ class VantageGUI:
                 except ValueError: pass
 
     def open_sys_settings(self):
-        """Directly opens Windows 11 sound settings."""
         try:
             subprocess.run("start ms-settings:sound", shell=True)
         except Exception as e:
