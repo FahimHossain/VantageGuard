@@ -175,12 +175,10 @@ def audio_engine_loop():
                 data = stream_in.read(CHUNK, exception_on_overflow=False)
                 
                 if len(data) == CHUNK * 2:
-                    # Waveform Processing
                     samples = struct.unpack(f"{CHUNK}h", data)
                     step = CHUNK // 64
                     current_waveform = [samples[i] for i in range(0, CHUNK, step)]
 
-                    # Audio Recording Injection
                     if is_recording and not is_recording_paused:
                         recorded_frames.append(data)
 
@@ -287,7 +285,6 @@ class VantageGUI:
         self.root = root
         self.root.title("VantageGuard")
         
-        # Widened to comfortably fit the split row 2 design
         self.root.geometry("740x510")
         self.root.minsize(720, 510)
         self.root.protocol("WM_DELETE_WINDOW", self.hide_window)
@@ -326,7 +323,7 @@ class VantageGUI:
         self.btn_toggle = ctk.CTkButton(self.mic_frame, text="Toggle Mic", width=120, height=40, font=ctk.CTkFont(size=14, weight="bold"), fg_color="transparent", border_width=2, text_color="white", command=toggle_mic)
         self.btn_toggle.grid(row=0, column=2, padx=20, pady=15, sticky="e")
 
-        # 2. Split Row Container (Recorder + Volume)
+        # 2. Split Row Container
         self.middle_container = ctk.CTkFrame(self.root, fg_color="transparent")
         self.middle_container.grid(row=1, column=0, padx=20, pady=(10, 10), sticky="nsew")
         self.middle_container.grid_columnconfigure(0, weight=1)
@@ -336,10 +333,6 @@ class VantageGUI:
         self.rec_frame = ctk.CTkFrame(self.middle_container, corner_radius=10, fg_color=COLOR_NEUTRAL)
         self.rec_frame.grid(row=0, column=0, padx=(0, 10), sticky="nsew")
         self.rec_frame.grid_columnconfigure(0, weight=1)
-        self.rec_frame.grid_columnconfigure(1, weight=0)
-        self.rec_frame.grid_columnconfigure(2, weight=0)
-        self.rec_frame.grid_columnconfigure(3, weight=0)
-        self.rec_frame.grid_columnconfigure(4, weight=0)
         self.rec_frame.grid_rowconfigure(0, weight=1)
 
         ctk.CTkLabel(self.rec_frame, text="Recorder:", font=ctk.CTkFont(weight="bold", size=14), text_color="white").grid(row=0, column=0, padx=15, pady=15, sticky="w")
@@ -359,10 +352,7 @@ class VantageGUI:
         # 2b. Microphone Volume Frame (Right)
         self.vol_frame = ctk.CTkFrame(self.middle_container, corner_radius=10, fg_color=COLOR_NEUTRAL)
         self.vol_frame.grid(row=0, column=1, padx=(10, 0), sticky="nsew")
-        self.vol_frame.grid_columnconfigure(0, weight=0)
         self.vol_frame.grid_columnconfigure(1, weight=1)
-        self.vol_frame.grid_columnconfigure(2, weight=0)
-        self.vol_frame.grid_columnconfigure(3, weight=0)
         self.vol_frame.grid_rowconfigure(0, weight=1)
         
         ctk.CTkLabel(self.vol_frame, text="Vol:", font=ctk.CTkFont(weight="bold", size=14), text_color="white").grid(row=0, column=0, padx=15, pady=15, sticky="w")
@@ -395,12 +385,24 @@ class VantageGUI:
         self.device_dropdown.set("System Default")
         self.device_dropdown.grid(row=1, column=1, columnspan=2, padx=10, pady=(5, 15), sticky="ew")
 
-        # 4. Waveform Visualizer Frame
+        # 4. Waveform & DB Visualizer Frame
         self.vis_frame = ctk.CTkFrame(self.root, corner_radius=10, fg_color=COLOR_CANVAS)
         self.vis_frame.grid(row=3, column=0, padx=20, pady=(10, 20), sticky="nsew")
         
-        self.canvas = tk.Canvas(self.vis_frame, bg=COLOR_CANVAS, highlightthickness=0, height=80)
-        self.canvas.pack(fill="both", expand=True, padx=10, pady=10)
+        # Split visualizer frame: Col 0 for DB Meter, Col 1 for Waveform
+        self.vis_frame.grid_columnconfigure(0, weight=0)
+        self.vis_frame.grid_columnconfigure(1, weight=1)
+        self.vis_frame.grid_rowconfigure(0, weight=1)
+        
+        # Peak DB Meter (Responsive Height)
+        self.db_meter = ctk.CTkProgressBar(self.vis_frame, orientation="vertical", width=12, fg_color="#2B2B2B")
+        self.db_meter.grid(row=0, column=0, padx=(15, 5), pady=10, sticky="ns")
+        self.db_meter.set(0)
+        self.current_meter_level = 0.0 # Used for smooth visual decay
+
+        # Waveform Canvas (Responsive Height & Width)
+        self.canvas = tk.Canvas(self.vis_frame, bg=COLOR_CANVAS, highlightthickness=0)
+        self.canvas.grid(row=0, column=1, padx=(5, 15), pady=10, sticky="nsew")
 
         self.refresh_colors()
         self.draw_waveform() 
@@ -448,7 +450,7 @@ class VantageGUI:
         try:
             wf = wave.open(filename, 'wb')
             wf.setnchannels(1)
-            wf.setsampwidth(2) # paInt16
+            wf.setsampwidth(2) 
             wf.setframerate(44100)
             wf.writeframes(b''.join(frames))
             wf.close()
@@ -535,7 +537,38 @@ class VantageGUI:
                 mid_y = height / 2
                 data = current_waveform 
                 
-                if data and len(data) > 1:
+                # --- DB Peak Meter Logic ---
+                if is_mic_muted or not data or len(data) <= 1:
+                    # Muted or no signal
+                    self.current_meter_level = 0.0
+                    self.db_meter.set(0)
+                    self.db_meter.configure(progress_color="#333333")
+                    
+                    # Force a perfect flatline to hide hardware noise floor
+                    line_color = COLOR_MUTED if is_mic_muted else COLOR_LIVE
+                    self.canvas.create_line(0, mid_y, width, mid_y, fill=line_color, width=2, tags="wave")
+                else:
+                    # Calculate Peak (Max Int16 amplitude is 32768)
+                    peak = max((abs(val) for val in data), default=0)
+                    target_level = min(1.0, peak / 32768.0)
+                    
+                    # Smooth Decay for better visual tracking
+                    if target_level > self.current_meter_level:
+                        self.current_meter_level = target_level
+                    else:
+                        self.current_meter_level = max(0.0, self.current_meter_level - 0.05)
+                        
+                    self.db_meter.set(self.current_meter_level)
+                    
+                    # Color Mapping: Red (Clipping), Yellow (Peaking), Green (Normal)
+                    if self.current_meter_level > 0.85:
+                        self.db_meter.configure(progress_color="#FF4C4C")
+                    elif self.current_meter_level > 0.60:
+                        self.db_meter.configure(progress_color="#FFD700")
+                    else:
+                        self.db_meter.configure(progress_color=COLOR_LIVE)
+
+                    # --- Waveform Draw Logic ---
                     points = []
                     x_step = width / (len(data) - 1)
                     
@@ -545,11 +578,7 @@ class VantageGUI:
                         y = max(0, min(height, y)) 
                         points.extend([x, y])
                     
-                    line_color = COLOR_MUTED if is_mic_muted else COLOR_LIVE
-                    self.canvas.create_line(*points, fill=line_color, width=2, tags="wave", smooth=True)
-                else:
-                    line_color = COLOR_MUTED if is_mic_muted else COLOR_LIVE
-                    self.canvas.create_line(0, mid_y, width, mid_y, fill=line_color, width=2, tags="wave")
+                    self.canvas.create_line(*points, fill=COLOR_LIVE, width=2, tags="wave", smooth=True)
                     
         self.root.after(40, self.draw_waveform)
 
