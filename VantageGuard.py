@@ -7,6 +7,7 @@ from tkinter import messagebox
 import customtkinter as ctk
 import configparser
 import os
+import sys
 import pyaudio
 import collections
 import struct
@@ -15,7 +16,7 @@ import subprocess
 import wave
 from PIL import Image, ImageDraw
 from ctypes import cast, POINTER
-from comtypes import CLSCTX_ALL, CoInitialize, CoUninitialize
+from comtypes import CLSCTX_ALL, CoInitialize
 from pycaw.pycaw import IAudioEndpointVolume, IMMDeviceEnumerator
 
 # --- Setup CustomTkinter Theme ---
@@ -111,7 +112,7 @@ def set_mic_mute_state(target_mute):
     if mic_volume:
         mic_volume.SetMute(target_mute, None)
         is_mic_muted = target_mute
-    CoUninitialize()
+    
     trigger_ui_update()
 
 def hotkey_triggered():
@@ -130,7 +131,6 @@ def get_mic_volume():
     vol = 1.0
     if mic_volume:
         vol = mic_volume.GetMasterVolumeLevelScalar()
-    CoUninitialize()
     return vol
 
 def set_mic_volume(val):
@@ -138,7 +138,7 @@ def set_mic_volume(val):
     mic_volume = get_mic_endpoint()
     if mic_volume:
         mic_volume.SetMasterVolumeLevelScalar(float(val), None)
-    CoUninitialize()
+    
     if app_ui:
         app_ui.lbl_vol_val.configure(text=f"{int(float(val)*100)}%")
 
@@ -330,11 +330,13 @@ class VantageGUI:
         self.root.protocol("WM_DELETE_WINDOW", self.hide_window)
 
         self.root.grid_columnconfigure(0, weight=1)
-        
         self.root.grid_rowconfigure(0, weight=0)
         self.root.grid_rowconfigure(1, weight=0)
         self.root.grid_rowconfigure(2, weight=0)
         self.root.grid_rowconfigure(3, weight=1)
+        
+        self.is_mini_mode = False
+        self.is_visible = True
         
         # Core UI Builds
         self.build_main_ui()
@@ -378,7 +380,6 @@ class VantageGUI:
         self.btn_listen = ctk.CTkButton(self.mic_frame, text="Record Key", width=90, height=40, font=ctk.CTkFont(size=14, weight="normal"), fg_color="transparent", hover_color="#307E53", command=self.set_hotkey_popup)
         self.btn_listen.grid(row=0, column=2, padx=(5, 5), pady=15)
         
-        # New Mini Dashboard Toggle
         self.btn_enter_mini = ctk.CTkButton(self.mic_frame, text="Mini", width=60, height=40, font=ctk.CTkFont(weight="bold"), fg_color="#333333", hover_color="#444444", command=self.enter_mini_mode)
         self.btn_enter_mini.grid(row=0, column=3, padx=(5, 5), pady=15)
 
@@ -470,14 +471,16 @@ class VantageGUI:
     def build_mini_ui(self):
         self.mini_win = tk.Toplevel(self.root)
         self.mini_win.geometry("160x55")
-        self.mini_win.overrideredirect(True) # Borderless
+        self.mini_win.overrideredirect(True) 
         self.mini_win.attributes("-topmost", True)
         
-        # We use a CTkFrame inside the standard tk Toplevel for correct styling
-        self.mini_bg = ctk.CTkFrame(self.mini_win, corner_radius=10, fg_color=COLOR_LIVE)
+        transparent_color = "#000001"
+        self.mini_win.configure(bg=transparent_color)
+        self.mini_win.attributes("-transparentcolor", transparent_color)
+        
+        self.mini_bg = ctk.CTkFrame(self.mini_win, corner_radius=10, fg_color=COLOR_LIVE, bg_color=transparent_color)
         self.mini_bg.pack(fill="both", expand=True)
         
-        # Draggable Background Binding
         self.mini_bg.bind("<ButtonPress-1>", self.start_move_mini)
         self.mini_bg.bind("<B1-Motion>", self.do_move_mini)
         
@@ -492,16 +495,18 @@ class VantageGUI:
         self.mini_win.withdraw()
 
     def enter_mini_mode(self):
-        self.root.withdraw()
-        # Center the mini window relative to screen size roughly
-        x = self.root.winfo_x() + (self.root.winfo_width() // 2) - 80
-        y = self.root.winfo_y() + (self.root.winfo_height() // 2) - 30
-        self.mini_win.geometry(f"+{x}+{y}")
-        self.mini_win.deiconify()
+        self.is_mini_mode = True
+        
+        if self.root.winfo_viewable():
+            x = self.root.winfo_x() + (self.root.winfo_width() // 2) - 80
+            y = self.root.winfo_y() + (self.root.winfo_height() // 2) - 30
+            self.mini_win.geometry(f"+{x}+{y}")
+            
+        self.show_window()
 
     def exit_mini_mode(self):
-        self.mini_win.withdraw()
-        self.root.deiconify()
+        self.is_mini_mode = False
+        self.show_window()
 
     def start_move_mini(self, event):
         self.mini_win.x = event.x
@@ -513,7 +518,6 @@ class VantageGUI:
         x = self.mini_win.winfo_x() + deltax
         y = self.mini_win.winfo_y() + deltay
         self.mini_win.geometry(f"+{x}+{y}")
-
 
     # --- Mode Toggles & UI Interactivity ---
 
@@ -655,11 +659,30 @@ class VantageGUI:
         except Exception as e:
             print(f"Could not open Windows settings: {e}")
 
+    # --- Master Visibility & Draw Logic ---
+    
+    def toggle_visibility(self):
+        if self.is_visible:
+            self.hide_window()
+        else:
+            self.show_window()
+
+    def hide_window(self):
+        self.is_visible = False
+        self.root.withdraw()
+        self.mini_win.withdraw()
+
+    def show_window(self):
+        self.is_visible = True
+        if self.is_mini_mode:
+            self.root.withdraw()
+            self.mini_win.deiconify()
+        else:
+            self.mini_win.withdraw()
+            self.root.deiconify()
+
     def refresh_colors(self):
-        # Update Main UI
         self.mic_frame.configure(fg_color=COLOR_MUTED if is_mic_muted else COLOR_LIVE)
-        
-        # Update Mini UI
         self.mini_bg.configure(fg_color=COLOR_MUTED if is_mic_muted else COLOR_LIVE)
         self.btn_mini_toggle.configure(text="🎙 MUTED" if is_mic_muted else "🎙 LIVE")
 
@@ -712,29 +735,40 @@ class VantageGUI:
                     
         self.root.after(40, self.draw_waveform)
 
-    def hide_window(self):
-        self.root.withdraw()
-        self.mini_win.withdraw()
-
-    def show_window(self):
-        self.root.deiconify()
 
 # --- System Tray Setup ---
+
+def on_toggle_visibility(icon, item):
+    if app_ui:
+        app_ui.toggle_visibility()
+
+def on_toggle_mini(icon, item):
+    if app_ui:
+        if app_ui.is_mini_mode:
+            app_ui.exit_mini_mode()
+        else:
+            app_ui.enter_mini_mode()
+
+def on_restart(icon, item):
+    icon.stop()
+    if app_ui:
+        app_ui.root.quit()
+    subprocess.Popen([sys.executable] + sys.argv)
+    os._exit(0)
 
 def on_quit(icon, item):
     icon.stop()
     if app_ui:
         app_ui.root.quit()
-
-def on_show(icon, item):
-    if app_ui:
-        app_ui.show_window()
+    os._exit(0)
 
 def run_tray():
     global tray_icon
     menu = pystray.Menu(
-        pystray.MenuItem('Show Window', on_show, default=True),
-        pystray.MenuItem('Quit', on_quit)
+        pystray.MenuItem('Toggle Window', on_toggle_visibility, default=True), 
+        pystray.MenuItem('Mini <-> Expanded', on_toggle_mini),
+        pystray.MenuItem('Restart', on_restart),
+        pystray.MenuItem('Exit', on_quit)
     )
     tray_icon = pystray.Icon("VantageGuard", create_icon_image(is_mic_muted), "VantageGuard", menu)
     tray_icon.run()
@@ -750,7 +784,6 @@ def main():
     mic = get_mic_endpoint()
     if mic:
         is_mic_muted = mic.GetMute()
-    CoUninitialize()
     
     input_devices_map = get_input_devices()
     
