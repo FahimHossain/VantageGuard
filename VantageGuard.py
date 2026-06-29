@@ -122,7 +122,9 @@ def hotkey_triggered():
     set_mic_mute_state(not is_mic_muted)
 
 def ui_toggle_mic():
-    """Triggered strictly by the UI button."""
+    """Triggered strictly by the UI button standard click."""
+    if settings.get('ptt_enabled', False):
+        return # Handled by explicit press/release bindings instead
     set_mic_mute_state(not is_mic_muted)
 
 def get_mic_volume():
@@ -166,7 +168,7 @@ def ptt_monitor_loop():
     """Constantly checks the physical key state to power Push-To-Talk mode."""
     was_pressed = False
     while True:
-        time.sleep(0.02) # Polls fast enough to feel instant without burning CPU
+        time.sleep(0.02)
         
         if not settings.get('ptt_enabled', False):
             was_pressed = False 
@@ -359,6 +361,7 @@ class VantageGUI:
         self.entry_hotkey = ctk.CTkEntry(self.hotkey_container, width=200, font=ctk.CTkFont(weight="bold", size=14))
         self.entry_hotkey.bind("<Return>", self.save_typed_hotkey)
         self.entry_hotkey.bind("<FocusOut>", self.save_typed_hotkey)
+        self.entry_hotkey.bind("<Escape>", self.cancel_typed_hotkey)
         
         # New PTT Switch
         self.ptt_switch = ctk.CTkSwitch(self.mic_frame, text="PTT", font=ctk.CTkFont(weight="bold", size=13), width=60, command=self.toggle_ptt_mode)
@@ -373,6 +376,8 @@ class VantageGUI:
 
         self.btn_toggle = ctk.CTkButton(self.mic_frame, text="Toggle Mic", width=120, height=40, font=ctk.CTkFont(size=14, weight="bold"), fg_color="transparent", border_width=2, text_color="white", command=ui_toggle_mic)
         self.btn_toggle.grid(row=0, column=3, padx=20, pady=15, sticky="e")
+        self.btn_toggle.bind("<ButtonPress-1>", self.ui_btn_press)
+        self.btn_toggle.bind("<ButtonRelease-1>", self.ui_btn_release)
 
         # 2. Split Row Container
         self.middle_container = ctk.CTkFrame(self.root, fg_color="transparent")
@@ -455,13 +460,22 @@ class VantageGUI:
         self.refresh_colors()
         self.draw_waveform() 
 
-    # --- Mode Toggles ---
+    # --- Mode Toggles & UI Interactivity ---
 
     def toggle_ptt_mode(self):
         settings['ptt_enabled'] = bool(self.ptt_switch.get())
         save_config()
-        # Ensure mic defaults to muted immediately when engaging PTT mode
         if settings['ptt_enabled']:
+            set_mic_mute_state(True)
+            
+    def ui_btn_press(self, event):
+        """PTT Mode: Unmute when UI button is held down."""
+        if settings.get('ptt_enabled', False):
+            set_mic_mute_state(False)
+
+    def ui_btn_release(self, event):
+        """PTT Mode: Mute instantly when UI button is released."""
+        if settings.get('ptt_enabled', False):
             set_mic_mute_state(True)
 
     # --- Recorder Logic ---
@@ -527,6 +541,14 @@ class VantageGUI:
         self.entry_hotkey.delete(0, 'end')
         self.entry_hotkey.insert(0, settings['mic_hotkey'].upper())
         self.entry_hotkey.focus()
+        
+    def cancel_typed_hotkey(self, event=None):
+        if not self.entry_hotkey.winfo_ismapped():
+            return
+        
+        self.entry_hotkey.grid_forget()
+        self.lbl_hotkey_text.configure(text=settings['mic_hotkey'].upper())
+        self.lbl_hotkey_text.grid(row=0, column=1, padx=(5, 0))
 
     def save_typed_hotkey(self, event=None):
         if not self.entry_hotkey.winfo_ismapped():
