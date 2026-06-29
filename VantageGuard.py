@@ -102,7 +102,6 @@ def get_mic_endpoint():
         return None
 
 def set_mic_mute_state(target_mute):
-    """Core function to explicitly set the mute state."""
     global is_mic_muted
     if is_mic_muted == target_mute:
         return
@@ -116,15 +115,13 @@ def set_mic_mute_state(target_mute):
     trigger_ui_update()
 
 def hotkey_triggered():
-    """Triggered by the global keyboard hook (Standard Toggle Mode)."""
     if settings.get('ptt_enabled', False):
-        return # Ignore standard toggle if PTT mode is handling the hotkey
+        return
     set_mic_mute_state(not is_mic_muted)
 
 def ui_toggle_mic():
-    """Triggered strictly by the UI button standard click."""
     if settings.get('ptt_enabled', False):
-        return # Handled by explicit press/release bindings instead
+        return 
     set_mic_mute_state(not is_mic_muted)
 
 def get_mic_volume():
@@ -165,7 +162,6 @@ def get_input_devices():
 # --- Background Services ---
 
 def ptt_monitor_loop():
-    """Constantly checks the physical key state to power Push-To-Talk mode."""
     was_pressed = False
     while True:
         time.sleep(0.02)
@@ -181,10 +177,10 @@ def ptt_monitor_loop():
             is_pressed = False
 
         if is_pressed and not was_pressed:
-            set_mic_mute_state(False) # Unmute on press
+            set_mic_mute_state(False) 
             was_pressed = True
         elif not is_pressed and was_pressed:
-            set_mic_mute_state(True)  # Mute on release
+            set_mic_mute_state(True) 
             was_pressed = False
 
 def audio_engine_loop():
@@ -329,7 +325,7 @@ class VantageGUI:
         self.root = root
         self.root.title("VantageGuard")
         
-        self.root.geometry("740x510")
+        self.root.geometry("820x510")
         self.root.minsize(720, 510)
         self.root.protocol("WM_DELETE_WINDOW", self.hide_window)
 
@@ -339,7 +335,15 @@ class VantageGUI:
         self.root.grid_rowconfigure(1, weight=0)
         self.root.grid_rowconfigure(2, weight=0)
         self.root.grid_rowconfigure(3, weight=1)
+        
+        # Core UI Builds
+        self.build_main_ui()
+        self.build_mini_ui()
+        
+        self.refresh_colors()
+        self.draw_waveform() 
 
+    def build_main_ui(self):
         # 1. Microphone Toggle Frame
         self.mic_frame = ctk.CTkFrame(self.root, corner_radius=10)
         self.mic_frame.grid(row=0, column=0, padx=20, pady=(20, 10), sticky="nsew")
@@ -347,6 +351,7 @@ class VantageGUI:
         self.mic_frame.grid_columnconfigure(1, weight=0)
         self.mic_frame.grid_columnconfigure(2, weight=0)
         self.mic_frame.grid_columnconfigure(3, weight=0)
+        self.mic_frame.grid_columnconfigure(4, weight=0)
         self.mic_frame.grid_rowconfigure(0, weight=1)
         
         self.hotkey_container = ctk.CTkFrame(self.mic_frame, fg_color="transparent")
@@ -358,24 +363,27 @@ class VantageGUI:
         self.lbl_hotkey_text.grid(row=0, column=1, padx=(5, 0))
         self.lbl_hotkey_text.bind("<Button-1>", self.edit_hotkey)
         
-        self.entry_hotkey = ctk.CTkEntry(self.hotkey_container, width=200, font=ctk.CTkFont(weight="bold", size=14))
+        self.entry_hotkey = ctk.CTkEntry(self.hotkey_container, width=150, font=ctk.CTkFont(weight="bold", size=14))
         self.entry_hotkey.bind("<Return>", self.save_typed_hotkey)
         self.entry_hotkey.bind("<FocusOut>", self.save_typed_hotkey)
         self.entry_hotkey.bind("<Escape>", self.cancel_typed_hotkey)
         
-        # New PTT Switch
         self.ptt_switch = ctk.CTkSwitch(self.mic_frame, text="PTT", font=ctk.CTkFont(weight="bold", size=13), width=60, command=self.toggle_ptt_mode)
-        self.ptt_switch.grid(row=0, column=1, padx=(10, 15), pady=15)
+        self.ptt_switch.grid(row=0, column=1, padx=(10, 10), pady=15)
         if settings.get('ptt_enabled'):
             self.ptt_switch.select()
         else:
             self.ptt_switch.deselect()
 
         self.btn_listen = ctk.CTkButton(self.mic_frame, text="Record Key", width=90, height=40, font=ctk.CTkFont(size=14, weight="normal"), fg_color="transparent", hover_color="#307E53", command=self.set_hotkey_popup)
-        self.btn_listen.grid(row=0, column=2, padx=10, pady=15)
+        self.btn_listen.grid(row=0, column=2, padx=(5, 5), pady=15)
+        
+        # New Mini Dashboard Toggle
+        self.btn_enter_mini = ctk.CTkButton(self.mic_frame, text="Mini", width=60, height=40, font=ctk.CTkFont(weight="bold"), fg_color="#333333", hover_color="#444444", command=self.enter_mini_mode)
+        self.btn_enter_mini.grid(row=0, column=3, padx=(5, 5), pady=15)
 
         self.btn_toggle = ctk.CTkButton(self.mic_frame, text="Toggle Mic", width=120, height=40, font=ctk.CTkFont(size=14, weight="bold"), fg_color="transparent", border_width=2, text_color="white", command=ui_toggle_mic)
-        self.btn_toggle.grid(row=0, column=3, padx=20, pady=15, sticky="e")
+        self.btn_toggle.grid(row=0, column=4, padx=20, pady=15, sticky="e")
         self.btn_toggle.bind("<ButtonPress-1>", self.ui_btn_press)
         self.btn_toggle.bind("<ButtonRelease-1>", self.ui_btn_release)
 
@@ -385,7 +393,7 @@ class VantageGUI:
         self.middle_container.grid_columnconfigure(0, weight=1)
         self.middle_container.grid_columnconfigure(1, weight=1)
 
-        # 2a. Recorder Frame (Left)
+        # 2a. Recorder Frame
         self.rec_frame = ctk.CTkFrame(self.middle_container, corner_radius=10, fg_color=COLOR_NEUTRAL)
         self.rec_frame.grid(row=0, column=0, padx=(0, 10), sticky="nsew")
         self.rec_frame.grid_columnconfigure(0, weight=1)
@@ -405,7 +413,7 @@ class VantageGUI:
         self.btn_folder = ctk.CTkButton(self.rec_frame, text="📁", width=35, height=35, font=ctk.CTkFont(size=18), fg_color="#333333", hover_color="#444444", command=self.action_folder)
         self.btn_folder.grid(row=0, column=4, padx=(5, 15), pady=15)
 
-        # 2b. Microphone Volume Frame (Right)
+        # 2b. Microphone Volume Frame 
         self.vol_frame = ctk.CTkFrame(self.middle_container, corner_radius=10, fg_color=COLOR_NEUTRAL)
         self.vol_frame.grid(row=0, column=1, padx=(10, 0), sticky="nsew")
         self.vol_frame.grid_columnconfigure(1, weight=1)
@@ -457,8 +465,55 @@ class VantageGUI:
         self.canvas = tk.Canvas(self.vis_frame, bg=COLOR_CANVAS, highlightthickness=0)
         self.canvas.grid(row=0, column=1, padx=(5, 15), pady=10, sticky="nsew")
 
-        self.refresh_colors()
-        self.draw_waveform() 
+    # --- Mini Docked Dashboard Logic ---
+    
+    def build_mini_ui(self):
+        self.mini_win = tk.Toplevel(self.root)
+        self.mini_win.geometry("160x55")
+        self.mini_win.overrideredirect(True) # Borderless
+        self.mini_win.attributes("-topmost", True)
+        
+        # We use a CTkFrame inside the standard tk Toplevel for correct styling
+        self.mini_bg = ctk.CTkFrame(self.mini_win, corner_radius=10, fg_color=COLOR_LIVE)
+        self.mini_bg.pack(fill="both", expand=True)
+        
+        # Draggable Background Binding
+        self.mini_bg.bind("<ButtonPress-1>", self.start_move_mini)
+        self.mini_bg.bind("<B1-Motion>", self.do_move_mini)
+        
+        self.btn_mini_toggle = ctk.CTkButton(self.mini_bg, text="🎙 LIVE", font=ctk.CTkFont(weight="bold", size=14), fg_color="transparent", hover_color="#222222", text_color="white", command=ui_toggle_mic)
+        self.btn_mini_toggle.pack(side="left", fill="both", expand=True, padx=5, pady=5)
+        self.btn_mini_toggle.bind("<ButtonPress-1>", self.ui_btn_press)
+        self.btn_mini_toggle.bind("<ButtonRelease-1>", self.ui_btn_release)
+
+        self.btn_mini_expand = ctk.CTkButton(self.mini_bg, text="⛶", width=30, font=ctk.CTkFont(weight="bold", size=14), fg_color="#333333", hover_color="#444444", command=self.exit_mini_mode)
+        self.btn_mini_expand.pack(side="right", fill="y", padx=(0, 5), pady=5)
+        
+        self.mini_win.withdraw()
+
+    def enter_mini_mode(self):
+        self.root.withdraw()
+        # Center the mini window relative to screen size roughly
+        x = self.root.winfo_x() + (self.root.winfo_width() // 2) - 80
+        y = self.root.winfo_y() + (self.root.winfo_height() // 2) - 30
+        self.mini_win.geometry(f"+{x}+{y}")
+        self.mini_win.deiconify()
+
+    def exit_mini_mode(self):
+        self.mini_win.withdraw()
+        self.root.deiconify()
+
+    def start_move_mini(self, event):
+        self.mini_win.x = event.x
+        self.mini_win.y = event.y
+
+    def do_move_mini(self, event):
+        deltax = event.x - self.mini_win.x
+        deltay = event.y - self.mini_win.y
+        x = self.mini_win.winfo_x() + deltax
+        y = self.mini_win.winfo_y() + deltay
+        self.mini_win.geometry(f"+{x}+{y}")
+
 
     # --- Mode Toggles & UI Interactivity ---
 
@@ -469,12 +524,10 @@ class VantageGUI:
             set_mic_mute_state(True)
             
     def ui_btn_press(self, event):
-        """PTT Mode: Unmute when UI button is held down."""
         if settings.get('ptt_enabled', False):
             set_mic_mute_state(False)
 
     def ui_btn_release(self, event):
-        """PTT Mode: Mute instantly when UI button is released."""
         if settings.get('ptt_enabled', False):
             set_mic_mute_state(True)
 
@@ -533,7 +586,7 @@ class VantageGUI:
             os.makedirs(RECORD_DIR)
         os.startfile(RECORD_DIR)
 
-    # --- UI Logic ---
+    # --- Text Field Logic ---
 
     def edit_hotkey(self, event):
         self.lbl_hotkey_text.grid_forget()
@@ -603,7 +656,12 @@ class VantageGUI:
             print(f"Could not open Windows settings: {e}")
 
     def refresh_colors(self):
+        # Update Main UI
         self.mic_frame.configure(fg_color=COLOR_MUTED if is_mic_muted else COLOR_LIVE)
+        
+        # Update Mini UI
+        self.mini_bg.configure(fg_color=COLOR_MUTED if is_mic_muted else COLOR_LIVE)
+        self.btn_mini_toggle.configure(text="🎙 MUTED" if is_mic_muted else "🎙 LIVE")
 
     def draw_waveform(self):
         if self.root.winfo_exists() and self.root.state() == "normal":
@@ -656,10 +714,10 @@ class VantageGUI:
 
     def hide_window(self):
         self.root.withdraw()
+        self.mini_win.withdraw()
 
     def show_window(self):
         self.root.deiconify()
-        self.root.lift()
 
 # --- System Tray Setup ---
 
