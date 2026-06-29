@@ -35,7 +35,8 @@ RECORD_DIR = os.path.join(os.path.expanduser('~'), 'Documents', 'VantageGuard_Re
 
 settings = {
     'mic_hotkey': 'f22',
-    'delay_val': 'No Delay'
+    'delay_val': 'No Delay',
+    'ptt_enabled': False
 }
 
 DELAY_MAP = {
@@ -58,12 +59,17 @@ def load_config():
         if 'Settings' in config:
             settings['mic_hotkey'] = config['Settings'].get('mic_hotkey', settings['mic_hotkey'])
             settings['delay_val'] = config['Settings'].get('delay_val', settings['delay_val'])
+            settings['ptt_enabled'] = config.getboolean('Settings', 'ptt_enabled', fallback=False)
     else:
         save_config()
 
 def save_config():
     config = configparser.ConfigParser()
-    config['Settings'] = settings
+    config['Settings'] = {
+        'mic_hotkey': settings['mic_hotkey'],
+        'delay_val': settings['delay_val'],
+        'ptt_enabled': str(settings['ptt_enabled'])
+    }
     with open(CONFIG_FILE, 'w') as configfile:
         config.write(configfile)
 
@@ -95,16 +101,29 @@ def get_mic_endpoint():
         print(f"Error accessing microphone: {e}")
         return None
 
-def toggle_mic():
+def set_mic_mute_state(target_mute):
+    """Core function to explicitly set the mute state."""
     global is_mic_muted
+    if is_mic_muted == target_mute:
+        return
+        
     CoInitialize() 
     mic_volume = get_mic_endpoint()
     if mic_volume:
-        current_mute = mic_volume.GetMute()
-        is_mic_muted = not current_mute
-        mic_volume.SetMute(is_mic_muted, None)
+        mic_volume.SetMute(target_mute, None)
+        is_mic_muted = target_mute
     CoUninitialize()
     trigger_ui_update()
+
+def hotkey_triggered():
+    """Triggered by the global keyboard hook (Standard Toggle Mode)."""
+    if settings.get('ptt_enabled', False):
+        return # Ignore standard toggle if PTT mode is handling the hotkey
+    set_mic_mute_state(not is_mic_muted)
+
+def ui_toggle_mic():
+    """Triggered strictly by the UI button."""
+    set_mic_mute_state(not is_mic_muted)
 
 def get_mic_volume():
     CoInitialize()
@@ -141,7 +160,30 @@ def get_input_devices():
         p.terminate()
     return devices
 
-# --- Continuous Audio Engine ---
+# --- Background Services ---
+
+def ptt_monitor_loop():
+    """Constantly checks the physical key state to power Push-To-Talk mode."""
+    was_pressed = False
+    while True:
+        time.sleep(0.02) # Polls fast enough to feel instant without burning CPU
+        
+        if not settings.get('ptt_enabled', False):
+            was_pressed = False 
+            continue
+        
+        try:
+            hk = settings['mic_hotkey']
+            is_pressed = keyboard.is_pressed(hk)
+        except Exception:
+            is_pressed = False
+
+        if is_pressed and not was_pressed:
+            set_mic_mute_state(False) # Unmute on press
+            was_pressed = True
+        elif not is_pressed and was_pressed:
+            set_mic_mute_state(True)  # Mute on release
+            was_pressed = False
 
 def audio_engine_loop():
     global current_waveform, recorded_frames
@@ -302,6 +344,7 @@ class VantageGUI:
         self.mic_frame.grid_columnconfigure(0, weight=1)
         self.mic_frame.grid_columnconfigure(1, weight=0)
         self.mic_frame.grid_columnconfigure(2, weight=0)
+        self.mic_frame.grid_columnconfigure(3, weight=0)
         self.mic_frame.grid_rowconfigure(0, weight=1)
         
         self.hotkey_container = ctk.CTkFrame(self.mic_frame, fg_color="transparent")
@@ -317,11 +360,19 @@ class VantageGUI:
         self.entry_hotkey.bind("<Return>", self.save_typed_hotkey)
         self.entry_hotkey.bind("<FocusOut>", self.save_typed_hotkey)
         
-        self.btn_listen = ctk.CTkButton(self.mic_frame, text="Record Key", width=90, height=40, font=ctk.CTkFont(size=14, weight="normal"), fg_color="transparent", hover_color="#307E53", command=self.set_hotkey_popup)
-        self.btn_listen.grid(row=0, column=1, padx=10, pady=15)
+        # New PTT Switch
+        self.ptt_switch = ctk.CTkSwitch(self.mic_frame, text="PTT", font=ctk.CTkFont(weight="bold", size=13), width=60, command=self.toggle_ptt_mode)
+        self.ptt_switch.grid(row=0, column=1, padx=(10, 15), pady=15)
+        if settings.get('ptt_enabled'):
+            self.ptt_switch.select()
+        else:
+            self.ptt_switch.deselect()
 
-        self.btn_toggle = ctk.CTkButton(self.mic_frame, text="Toggle Mic", width=120, height=40, font=ctk.CTkFont(size=14, weight="bold"), fg_color="transparent", border_width=2, text_color="white", command=toggle_mic)
-        self.btn_toggle.grid(row=0, column=2, padx=20, pady=15, sticky="e")
+        self.btn_listen = ctk.CTkButton(self.mic_frame, text="Record Key", width=90, height=40, font=ctk.CTkFont(size=14, weight="normal"), fg_color="transparent", hover_color="#307E53", command=self.set_hotkey_popup)
+        self.btn_listen.grid(row=0, column=2, padx=10, pady=15)
+
+        self.btn_toggle = ctk.CTkButton(self.mic_frame, text="Toggle Mic", width=120, height=40, font=ctk.CTkFont(size=14, weight="bold"), fg_color="transparent", border_width=2, text_color="white", command=ui_toggle_mic)
+        self.btn_toggle.grid(row=0, column=3, padx=20, pady=15, sticky="e")
 
         # 2. Split Row Container
         self.middle_container = ctk.CTkFrame(self.root, fg_color="transparent")
@@ -389,23 +440,29 @@ class VantageGUI:
         self.vis_frame = ctk.CTkFrame(self.root, corner_radius=10, fg_color=COLOR_CANVAS)
         self.vis_frame.grid(row=3, column=0, padx=20, pady=(10, 20), sticky="nsew")
         
-        # Split visualizer frame: Col 0 for DB Meter, Col 1 for Waveform
         self.vis_frame.grid_columnconfigure(0, weight=0)
         self.vis_frame.grid_columnconfigure(1, weight=1)
         self.vis_frame.grid_rowconfigure(0, weight=1)
         
-        # Peak DB Meter (Responsive Height)
         self.db_meter = ctk.CTkProgressBar(self.vis_frame, orientation="vertical", width=12, fg_color="#2B2B2B")
         self.db_meter.grid(row=0, column=0, padx=(15, 5), pady=10, sticky="ns")
         self.db_meter.set(0)
-        self.current_meter_level = 0.0 # Used for smooth visual decay
+        self.current_meter_level = 0.0 
 
-        # Waveform Canvas (Responsive Height & Width)
         self.canvas = tk.Canvas(self.vis_frame, bg=COLOR_CANVAS, highlightthickness=0)
         self.canvas.grid(row=0, column=1, padx=(5, 15), pady=10, sticky="nsew")
 
         self.refresh_colors()
         self.draw_waveform() 
+
+    # --- Mode Toggles ---
+
+    def toggle_ptt_mode(self):
+        settings['ptt_enabled'] = bool(self.ptt_switch.get())
+        save_config()
+        # Ensure mic defaults to muted immediately when engaging PTT mode
+        if settings['ptt_enabled']:
+            set_mic_mute_state(True)
 
     # --- Recorder Logic ---
 
@@ -483,12 +540,12 @@ class VantageGUI:
                 try: keyboard.remove_hotkey(current)
                 except ValueError: pass
                 
-                keyboard.add_hotkey(new_key, toggle_mic)
+                keyboard.add_hotkey(new_key, hotkey_triggered)
                 settings['mic_hotkey'] = new_key
                 save_config()
             except Exception as e:
                 messagebox.showerror("Error", f"Invalid hotkey format (e.g. 'f22', 'ctrl+k').\n\nError: {e}")
-                try: keyboard.add_hotkey(current, toggle_mic)
+                try: keyboard.add_hotkey(current, hotkey_triggered)
                 except ValueError: pass
 
         self.entry_hotkey.grid_forget()
@@ -506,7 +563,7 @@ class VantageGUI:
                 try: keyboard.remove_hotkey(current)
                 except ValueError: pass
                 
-                keyboard.add_hotkey(new_key, toggle_mic)
+                keyboard.add_hotkey(new_key, hotkey_triggered)
                 self.lbl_hotkey_text.configure(text=new_key.upper())
                 
                 settings['mic_hotkey'] = new_key
@@ -514,7 +571,7 @@ class VantageGUI:
                 
             except Exception as e:
                 messagebox.showerror("Error", f"Could not bind hotkey.\n\nError: {e}")
-                try: keyboard.add_hotkey(current, toggle_mic)
+                try: keyboard.add_hotkey(current, hotkey_triggered)
                 except ValueError: pass
 
     def open_sys_settings(self):
@@ -537,22 +594,17 @@ class VantageGUI:
                 mid_y = height / 2
                 data = current_waveform 
                 
-                # --- DB Peak Meter Logic ---
                 if is_mic_muted or not data or len(data) <= 1:
-                    # Muted or no signal
                     self.current_meter_level = 0.0
                     self.db_meter.set(0)
                     self.db_meter.configure(progress_color="#333333")
                     
-                    # Force a perfect flatline to hide hardware noise floor
                     line_color = COLOR_MUTED if is_mic_muted else COLOR_LIVE
                     self.canvas.create_line(0, mid_y, width, mid_y, fill=line_color, width=2, tags="wave")
                 else:
-                    # Calculate Peak (Max Int16 amplitude is 32768)
                     peak = max((abs(val) for val in data), default=0)
                     target_level = min(1.0, peak / 32768.0)
                     
-                    # Smooth Decay for better visual tracking
                     if target_level > self.current_meter_level:
                         self.current_meter_level = target_level
                     else:
@@ -560,7 +612,6 @@ class VantageGUI:
                         
                     self.db_meter.set(self.current_meter_level)
                     
-                    # Color Mapping: Red (Clipping), Yellow (Peaking), Green (Normal)
                     if self.current_meter_level > 0.85:
                         self.db_meter.configure(progress_color="#FF4C4C")
                     elif self.current_meter_level > 0.60:
@@ -568,7 +619,6 @@ class VantageGUI:
                     else:
                         self.db_meter.configure(progress_color=COLOR_LIVE)
 
-                    # --- Waveform Draw Logic ---
                     points = []
                     x_step = width / (len(data) - 1)
                     
@@ -624,10 +674,11 @@ def main():
     
     input_devices_map = get_input_devices()
     
-    try: keyboard.add_hotkey(settings['mic_hotkey'], toggle_mic)
+    try: keyboard.add_hotkey(settings['mic_hotkey'], hotkey_triggered)
     except Exception: pass
 
     threading.Thread(target=audio_engine_loop, daemon=True).start()
+    threading.Thread(target=ptt_monitor_loop, daemon=True).start()
     threading.Thread(target=run_tray, daemon=True).start()
 
     root = ctk.CTk()
